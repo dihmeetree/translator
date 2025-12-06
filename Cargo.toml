@@ -1,0 +1,64 @@
+[package]
+name = "twitch-translator"
+version = "0.1.0"
+edition = "2021"
+description = "A Twitch chat translator that translates non-English messages to English"
+
+[[bin]]
+name = "twitch-translator"
+path = "src/main.rs"
+
+[[bin]]
+name = "translation-api"
+path = "src/api.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP client for translation API
+reqwest = { version = "0.11", features = ["json"] }
+
+# JSON serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Colored terminal output
+colored = "2.1"
+
+# Language detection
+whatlang = "0.16"
+
+# Environment variables and configuration
+dotenvy = "0.15"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL encoding
+urlencoding = "2.1"
+
+# Async channels
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Terminal size detection
+terminal_size = "0.4"
+
+# Terminal manipulation for spinner
+crossterm = "0.28"
+
+# Transliteration fallback when Google doesn't provide romanization
+any_ascii = "0.3"
+
+# HTTP server for translation API
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# SQLite for persistent translation cache
+rusqlite = { version = "0.31", features = ["bundled"] }
