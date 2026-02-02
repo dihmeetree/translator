@@ -1,3 +1,7 @@
 /target
 .env
 translation_cache.db
+
+# Frontend build artifacts
+ui/node_modules
+ui/dist

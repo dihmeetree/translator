@@ -253,8 +253,6 @@ impl TwitchClient {
         print_thick_divider();
         println!("{}", "Waiting for messages...".bright_black().italic());
 
-        let irc_timeout = Duration::from_secs(self.config.irc_timeout_secs);
-
         loop {
             // Produce a LoopAction from select! without holding &mut self borrows,
             // then handle it separately to allow full &mut self access.
@@ -262,58 +260,52 @@ impl TwitchClient {
             // so we don't borrow self inside the macro.
             let interim_deadline = self.interim_set_at.map(|t| t + INTERIM_COMMIT_TIMEOUT);
 
-            let action = if let Some(ref mut stt_rx) = self.stt_rx {
-                tokio::select! {
-                    ws_result = timeout(irc_timeout, self.ws_stream.next()) => {
-                        match ws_result {
-                            Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
-                            Ok(Some(Ok(_))) => continue,
-                            Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
-                            Ok(None) => LoopAction::IrcClosed,
-                            Err(_) => LoopAction::IrcTimeout,
-                        }
-                    }
-                    stt_event = stt_rx.recv() => {
-                        match stt_event {
-                            Some(event) => LoopAction::SttEvent(event),
-                            None => LoopAction::SttClosed,
-                        }
-                    }
-                    // Auto-commit stale interims that Deepgram never finalized
-                    _ = async {
-                        match interim_deadline {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => {
-                        LoopAction::SttInterimTimeout
-                    }
-                    cmd = self.control_rx.recv() => {
-                        match cmd {
-                            Some(ControlCommand::SwitchChannel(ch)) => LoopAction::SwitchChannel(ch),
-                            None => continue,
-                        }
+            // Temporarily take stt_rx out of self so the select! macro
+            // can split-borrow self.ws_stream and self.control_rx independently.
+            let mut stt_rx_tmp = self.stt_rx.take();
+            let has_stt = stt_rx_tmp.is_some();
+
+            let action = tokio::select! {
+                ws_result = timeout(Duration::from_secs(300), self.ws_stream.next()) => {
+                    match ws_result {
+                        Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
+                        Ok(Some(Ok(_))) => { self.stt_rx = stt_rx_tmp; continue; }
+                        Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
+                        Ok(None) => LoopAction::IrcClosed,
+                        Err(_) => LoopAction::IrcTimeout,
                     }
                 }
-            } else {
-                tokio::select! {
-                    ws_result = timeout(irc_timeout, self.ws_stream.next()) => {
-                        match ws_result {
-                            Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
-                            Ok(Some(Ok(_))) => continue,
-                            Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
-                            Ok(None) => LoopAction::IrcClosed,
-                            Err(_) => LoopAction::IrcTimeout,
-                        }
+                stt_event = async {
+                    match &mut stt_rx_tmp {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
-                    cmd = self.control_rx.recv() => {
-                        match cmd {
-                            Some(ControlCommand::SwitchChannel(ch)) => LoopAction::SwitchChannel(ch),
-                            None => continue,
-                        }
+                } => {
+                    match stt_event {
+                        Some(event) => LoopAction::SttEvent(event),
+                        None => LoopAction::SttClosed,
+                    }
+                }
+                // Auto-commit stale interims that Deepgram never finalized.
+                // Only active when STT is enabled (has_stt).
+                _ = async {
+                    match interim_deadline.filter(|_| has_stt) {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    LoopAction::SttInterimTimeout
+                }
+                cmd = self.control_rx.recv() => {
+                    match cmd {
+                        Some(ControlCommand::SwitchChannel(ch)) => LoopAction::SwitchChannel(ch),
+                        None => { self.stt_rx = stt_rx_tmp; continue; }
                     }
                 }
             };
+
+            // Put stt_rx back after select! completes
+            self.stt_rx = stt_rx_tmp;
 
             match action {
                 LoopAction::IrcMessage(text) => {
@@ -518,7 +510,7 @@ impl TwitchClient {
                 display_reply_context(reply);
             }
 
-            // Detect language and translate if non-English
+            // Detect language and translate
             let (source_lang, lang_name, translation_result) = detect_and_translate(
                 &translator,
                 &msg.content,
@@ -536,7 +528,7 @@ impl TwitchClient {
                     colored_name,
                     msg.content.bright_white()
                 );
-                display_translation_result(&msg.content, lang_name.as_deref(), result);
+                print_translation_lines(&msg.content, result, lang_name.as_deref());
             } else {
                 println!("{}{}: {}", badge_prefix, colored_name, msg.content);
             }
@@ -754,7 +746,7 @@ impl TwitchClient {
                 transcript.bright_white()
             );
 
-            // Detect language and translate if non-English
+            // Detect language and translate
             let (source_lang, lang_name, translation_result) = detect_and_translate(
                 &translator,
                 &transcript,
@@ -765,7 +757,7 @@ impl TwitchClient {
 
             // Terminal display of translation
             if let Some(ref result) = translation_result {
-                display_translation_result(&transcript, lang_name.as_deref(), result);
+                print_translation_lines(&transcript, result, lang_name.as_deref());
             }
 
             // Skip broadcasting if the channel has changed since this task spawned
@@ -789,24 +781,63 @@ impl TwitchClient {
     }
 }
 
-/// Detects the language of the given text and translates it if non-English.
+/// Displays the context of a reply (the message being replied to).
 ///
-/// Handles both "forced language" mode (when `default_lang` is set) and
-/// auto-detection mode. Returns a tuple of `(source_lang, lang_name, translation_result)`.
+/// Prints a dimmed "replying to @User: message" line above the chat message.
+fn display_reply_context(reply: &ReplyInfo) {
+    let max_chars = 50;
+    // Collect at most max_chars+1 to detect truncation in a single pass,
+    // avoiding a separate .count() iteration over the full string.
+    let preview: String = reply.parent_msg_body.chars().take(max_chars + 1).collect();
+    let truncated_body = if preview.chars().count() > max_chars {
+        // Drop the extra char and append ellipsis
+        let truncated: String = preview.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    } else {
+        preview
+    };
+
+    println!(
+        "  {} {} {}",
+        "┌─ replying to".bright_black(),
+        reply.parent_display_name.bright_blue(),
+        format!("\"{}\"", truncated_body).bright_black().italic()
+    );
+}
+
+/// Detects the language of `text` and translates it if non-English.
+///
+/// When `default_lang` is set, all messages are translated from that language,
+/// bypassing auto-detection. Otherwise, `whatlang` is used for detection and
+/// `threshold` gates the minimum confidence required.
+///
+/// Returns `(source_language, language_name, translation_result)`.
 async fn detect_and_translate(
     translator: &Translator,
     text: &str,
     default_lang: &Option<String>,
-    confidence_threshold: f64,
+    threshold: f64,
 ) -> (Option<String>, Option<String>, Option<TranslationResult>) {
     if let Some(ref lang) = *default_lang {
-        let result = translate_for_display(translator, text, lang).await;
+        let result = match translator.translate(text, lang).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Translation failed: {}", e);
+                None
+            }
+        };
         (Some(lang.clone()), Some(lang.to_uppercase()), result)
     } else {
         let detection = translator.detect_language(text);
         match detection {
-            Some(ref det) if !det.is_english && det.confidence >= confidence_threshold => {
-                let result = translate_for_display(translator, text, &det.language).await;
+            Some(ref det) if !det.is_english && det.confidence >= threshold => {
+                let result = match translator.translate(text, &det.language).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("Translation failed: {}", e);
+                        None
+                    }
+                };
                 (
                     Some(det.language.clone()),
                     Some(det.language_name.clone()),
@@ -818,20 +849,18 @@ async fn detect_and_translate(
     }
 }
 
-/// Prints the translation result (romanization + translated text) to the terminal.
+/// Prints romanization and translation lines to the terminal.
 ///
-/// Shows nothing if the translation is identical to the source text (case-insensitive).
-fn display_translation_result(
-    source_text: &str,
-    lang_name: Option<&str>,
-    result: &TranslationResult,
-) {
+/// Shows the romanization (♪) and translated text (↳ [LANG]) beneath the
+/// original message. Skips output when the translation matches the original
+/// (case-insensitive) to avoid redundant display.
+fn print_translation_lines(original: &str, result: &TranslationResult, lang_name: Option<&str>) {
     let has_translation = !result
         .translation
         .trim()
-        .eq_ignore_ascii_case(source_text.trim());
+        .eq_ignore_ascii_case(original.trim());
     if has_translation {
-        if let Some(romanization) = get_romanization(source_text, result.romanization.as_deref()) {
+        if let Some(romanization) = get_romanization(original, result.romanization.as_deref()) {
             println!(
                 "  {} {}",
                 "♪".bright_yellow(),
@@ -850,46 +879,6 @@ fn display_translation_result(
     }
 }
 
-/// Displays the context of a reply (the message being replied to).
-///
-/// Prints a dimmed "replying to @User: message" line above the chat message.
-fn display_reply_context(reply: &ReplyInfo) {
-    let max_chars = 50;
-    let truncated_body: String = if reply.parent_msg_body.chars().count() > max_chars {
-        let truncated: String = reply.parent_msg_body.chars().take(max_chars).collect();
-        format!("{}...", truncated)
-    } else {
-        reply.parent_msg_body.clone()
-    };
-
-    println!(
-        "  {} {} {}",
-        "┌─ replying to".bright_black(),
-        reply.parent_display_name.bright_blue(),
-        format!("\"{}\"", truncated_body).bright_black().italic()
-    );
-}
-
-/// Translates text using the translator, returning the result without terminal spinner.
-///
-/// Used by spawned background tasks for parallel translation processing.
-/// Logs errors but does not print to terminal on failure (the spawned task
-/// handles its own terminal output).
-async fn translate_for_display(
-    translator: &Translator,
-    content: &str,
-    source_lang: &str,
-) -> Option<TranslationResult> {
-    match translator.translate(content, source_lang).await {
-        Ok(Some(tr)) => Some(tr),
-        Ok(None) => None,
-        Err(e) => {
-            debug!("Translation failed: {}", e);
-            None
-        }
-    }
-}
-
 /// Colorizes a username based on Twitch color or generates one.
 fn colorize_username(username: &str, color: &Option<String>) -> colored::ColoredString {
     if let Some(hex) = color {
@@ -898,10 +887,12 @@ fn colorize_username(username: &str, color: &Option<String>) -> colored::Colored
         }
     }
 
-    // Generate a consistent color based on username hash
-    let hash = username
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+    // Generate a consistent color based on username hash.
+    // Uses DefaultHasher (SipHash) for better distribution than a byte sum.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    username.hash(&mut hasher);
+    let hash = hasher.finish() as u32;
     let colors = [
         (255, 0, 0),     // Red
         (0, 255, 0),     // Green

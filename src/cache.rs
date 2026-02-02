@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
+/// Number of inserts between cache size checks.
+/// Avoids running a SQLite size query on every single insert.
+const CLEANUP_CHECK_INTERVAL: u32 = 50;
+
 /// Percentage of entries to remove when cache is full (20%).
 const CLEANUP_PERCENTAGE: f64 = 0.20;
 
@@ -35,6 +39,8 @@ pub struct TranslationCache {
     max_size_bytes: u64,
     /// Counter for cleanup operations to batch VACUUM calls.
     cleanup_count: Arc<AtomicU32>,
+    /// Counter for inserts to rate-limit cleanup size checks.
+    insert_count: Arc<AtomicU32>,
 }
 
 impl TranslationCache {
@@ -56,15 +62,12 @@ impl TranslationCache {
         let conn =
             Connection::open(&db_path).context("Failed to open translation cache database")?;
 
-        // Enable WAL mode for better concurrent read/write performance.
-        // WAL allows readers and a single writer to operate concurrently
-        // without blocking each other, which matters when multiple spawned
-        // translation tasks write to the cache simultaneously.
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
-        )
-        .context("Failed to set SQLite pragmas")?;
+        // Enable WAL mode for better concurrent read/write performance:
+        // readers don't block writers and vice versa.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // NORMAL sync is sufficient for a cache — losing the last
+        // transaction on a power failure is acceptable.
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
 
         // Initialize schema
         // Note: UNIQUE constraint on (source_text, source_lang) automatically creates an index,
@@ -94,6 +97,7 @@ impl TranslationCache {
             conn: Arc::new(Mutex::new(conn)),
             max_size_bytes,
             cleanup_count: Arc::new(AtomicU32::new(0)),
+            insert_count: Arc::new(AtomicU32::new(0)),
         };
 
         // Check size on startup and cleanup if needed
@@ -108,7 +112,7 @@ impl TranslationCache {
     ///
     /// Updates the last_accessed timestamp on hit.
     pub fn get(&self, text: &str, source_lang: &str) -> Option<CachedTranslation> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().expect("cache mutex poisoned");
 
         // Try to fetch and update last_accessed in one go
         let result = conn.query_row(
@@ -144,7 +148,7 @@ impl TranslationCache {
         translation: &str,
         romanization: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().expect("cache mutex poisoned");
 
         conn.execute(
             "INSERT INTO translations (source_text, source_lang, translation, romanization)
@@ -159,9 +163,16 @@ impl TranslationCache {
 
         drop(conn);
 
-        // Check if cleanup is needed (do this after releasing the lock)
-        if let Err(e) = self.cleanup_if_needed() {
-            warn!("Failed to cleanup cache: {}", e);
+        // Rate-limit cleanup size checks to every CLEANUP_CHECK_INTERVAL inserts
+        // to avoid running a SQLite pragma query on every single insert.
+        if self
+            .insert_count
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(CLEANUP_CHECK_INTERVAL)
+        {
+            if let Err(e) = self.cleanup_if_needed() {
+                warn!("Failed to cleanup cache: {}", e);
+            }
         }
 
         Ok(())
@@ -169,7 +180,7 @@ impl TranslationCache {
 
     /// Returns the current size of the cache database in bytes.
     pub fn size_bytes(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().expect("cache mutex poisoned");
 
         let size: i64 = conn
             .query_row(
@@ -180,18 +191,6 @@ impl TranslationCache {
             .context("Failed to get cache size")?;
 
         Ok(size as u64)
-    }
-
-    /// Returns the number of cached translations.
-    #[allow(dead_code)]
-    pub fn entry_count(&self) -> Result<u64> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM translations", [], |row| row.get(0))
-            .context("Failed to get cache entry count")?;
-
-        Ok(count as u64)
     }
 
     /// Cleans up old entries if the cache exceeds the size limit.
@@ -210,7 +209,7 @@ impl TranslationCache {
             self.max_size_bytes as f64 / 1024.0 / 1024.0
         );
 
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().expect("cache mutex poisoned");
 
         // Get total count
         let total_count: i64 =
@@ -247,18 +246,6 @@ impl TranslationCache {
             }
         }
 
-        Ok(())
-    }
-
-    /// Clears all cached translations.
-    #[allow(dead_code)]
-    pub fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-
-        conn.execute("DELETE FROM translations", [])?;
-        conn.execute("VACUUM", [])?;
-
-        info!("Translation cache cleared");
         Ok(())
     }
 }
@@ -303,6 +290,7 @@ mod tests {
             conn: Arc::new(Mutex::new(conn)),
             max_size_bytes: 50 * 1024 * 1024, // 50 MB
             cleanup_count: Arc::new(AtomicU32::new(0)),
+            insert_count: Arc::new(AtomicU32::new(0)),
         }
     }
 

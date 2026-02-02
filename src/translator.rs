@@ -192,11 +192,12 @@ impl Translator {
 
         // Check cache for the core (non-ASCII) portion
         if let Some(cached) = self.cache.get(&core_lower, source_lang) {
-            // Reconstruct full translation with original ASCII prefix/suffix
-            let full_translation = format!("{}{}{}", prefix, cached.translation, suffix);
+            // Reconstruct full translation with original ASCII prefix/suffix.
+            // Fast path avoids allocation when affixes are empty (the common case).
+            let full_translation = reconstruct_with_affixes(prefix, &cached.translation, suffix);
             let full_romanization = cached
                 .romanization
-                .map(|r| format!("{}{}{}", prefix, r, suffix));
+                .map(|r| reconstruct_with_affixes(prefix, &r, suffix));
             return Ok(Some(TranslationResult {
                 translation: full_translation,
                 romanization: full_romanization,
@@ -221,11 +222,12 @@ impl Translator {
             warn!("Failed to cache translation: {}", e);
         }
 
-        // Reconstruct full translation with original ASCII prefix/suffix
-        let full_translation = format!("{}{}{}", prefix, result.translation, suffix);
+        // Reconstruct full translation with original ASCII prefix/suffix.
+        // Fast path avoids allocation when affixes are empty (the common case).
+        let full_translation = reconstruct_with_affixes(prefix, &result.translation, suffix);
         let full_romanization = result
             .romanization
-            .map(|r| format!("{}{}{}", prefix, r, suffix));
+            .map(|r| reconstruct_with_affixes(prefix, &r, suffix));
 
         Ok(Some(TranslationResult {
             translation: full_translation,
@@ -393,6 +395,12 @@ fn needs_translation(text: &str) -> bool {
         return false;
     }
 
+    // Fast path: byte-level ASCII check avoids char iteration for
+    // all-ASCII messages, which are the majority of Twitch chat.
+    if trimmed.is_ascii() {
+        return false;
+    }
+
     // Check if any character is non-ASCII and not an emoji
     // Emojis are in ranges like U+1F000-U+1FFFF, U+2600-U+26FF, etc.
     trimmed.chars().any(|c| !c.is_ascii() && !is_emoji(c))
@@ -433,46 +441,48 @@ fn is_emoji(c: char) -> bool {
 /// - `core`: The non-ASCII portion to be translated/cached
 /// - `suffix`: Trailing ASCII characters (including spaces)
 fn extract_ascii_affixes(text: &str) -> (&str, &str, &str) {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-
-    if len == 0 {
+    if text.is_empty() {
         return ("", "", "");
     }
 
-    // Find the first non-ASCII character (excluding emojis)
-    let mut first_non_ascii = None;
-    for (i, &c) in chars.iter().enumerate() {
-        if !c.is_ascii() && !is_emoji(c) {
-            first_non_ascii = Some(i);
-            break;
-        }
-    }
+    // Find the byte offset of the first non-ASCII, non-emoji character.
+    // Uses char_indices() directly on &str to avoid allocating a Vec<char>.
+    let first_byte = text
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii() && !is_emoji(*c))
+        .map(|(i, _)| i);
 
     // If no non-ASCII found, return entire text as core (will likely be skipped by needs_translation)
-    let first_non_ascii = match first_non_ascii {
+    let first_byte = match first_byte {
         Some(i) => i,
         None => return ("", text, ""),
     };
 
-    // Find the last non-ASCII character (excluding emojis)
-    let mut last_non_ascii = first_non_ascii;
-    for (i, &c) in chars.iter().enumerate().rev() {
-        if !c.is_ascii() && !is_emoji(c) {
-            last_non_ascii = i;
-            break;
-        }
-    }
+    // Find the byte offset just past the last non-ASCII, non-emoji character.
+    let (last_byte_start, last_char) = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii() && !is_emoji(*c))
+        .expect("guaranteed by first_byte existing");
+    let last_byte_end = last_byte_start + last_char.len_utf8();
 
-    // Calculate byte offsets from character indices
-    let prefix_byte_end: usize = chars[..first_non_ascii].iter().map(|c| c.len_utf8()).sum();
-    let suffix_byte_start: usize = chars[..=last_non_ascii].iter().map(|c| c.len_utf8()).sum();
-
-    let prefix = &text[..prefix_byte_end];
-    let core = &text[prefix_byte_end..suffix_byte_start];
-    let suffix = &text[suffix_byte_start..];
+    let prefix = &text[..first_byte];
+    let core = &text[first_byte..last_byte_end];
+    let suffix = &text[last_byte_end..];
 
     (prefix, core, suffix)
+}
+
+/// Reconstructs a string by joining a prefix, core, and suffix.
+///
+/// Avoids a `format!` allocation when both affixes are empty, which is
+/// the common case for purely non-ASCII text like "привет".
+fn reconstruct_with_affixes(prefix: &str, core: &str, suffix: &str) -> String {
+    if prefix.is_empty() && suffix.is_empty() {
+        core.to_string()
+    } else {
+        format!("{}{}{}", prefix, core, suffix)
+    }
 }
 
 #[cfg(test)]

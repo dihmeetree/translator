@@ -34,7 +34,6 @@ dotenvy = "0.15"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
@@ -49,9 +48,6 @@ futures-util = "0.3"
 
 # Terminal size detection
 terminal_size = "0.4"
-
-# Terminal manipulation for spinner
-crossterm = "0.28"
 
 # Transliteration fallback when Google doesn't provide romanization
 any_ascii = "0.3"

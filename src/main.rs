@@ -144,17 +144,8 @@ async fn main() -> Result<()> {
     )?;
     let mut client = TwitchClient::new(config, translator, event_tx, control_rx).await?;
 
-    // Run the client with graceful shutdown on SIGINT/SIGTERM.
-    // This ensures child processes (streamlink, ffmpeg) and the transcription
-    // pipeline are cleaned up properly when the container or user stops the app.
-    tokio::select! {
-        result = client.run() => {
-            result?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal, exiting...");
-        }
-    }
+    // Start processing chat messages
+    client.run().await?;
 
     Ok(())
 }

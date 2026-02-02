@@ -29,6 +29,9 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Minimum transcript length to display (filters noise artifacts).
 const MIN_TRANSCRIPT_LEN: usize = 2;
 
+/// Deepgram CloseStream message sent when audio ends or shutdown is requested.
+const CLOSE_STREAM_MSG: &str = r#"{"type":"CloseStream"}"#;
+
 /// Events sent from the transcription pipeline to the display loop.
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
@@ -97,18 +100,15 @@ type DgWsStream =
 
 /// Verifies that a required external command is installed and accessible on PATH.
 ///
-/// Uses `tokio::process::Command` to avoid blocking the async runtime.
-///
 /// # Errors
 ///
 /// Returns an error with the install hint if the command is not found.
-async fn check_dependency(command: &str, install_hint: &str) -> Result<()> {
-    match tokio::process::Command::new("which")
+fn check_dependency(command: &str, install_hint: &str) -> Result<()> {
+    match std::process::Command::new("which")
         .arg(command)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .await
     {
         Ok(status) if status.success() => Ok(()),
         _ => anyhow::bail!("'{}' not found on PATH. {}", command, install_hint),
@@ -290,23 +290,19 @@ pub async fn run_pipeline(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     // Pre-flight dependency checks
-    if let Err(e) = check_dependency("streamlink", "Install with: pip install streamlink").await {
-        error!("{}", e);
-        let _ = event_tx
-            .send(TranscriptionEvent::Error(e.to_string()))
-            .await;
-        let _ = event_tx.send(TranscriptionEvent::Shutdown).await;
-        return;
-    }
-    if let Err(e) =
-        check_dependency("ffmpeg", "Install from: https://ffmpeg.org/download.html").await
-    {
-        error!("{}", e);
-        let _ = event_tx
-            .send(TranscriptionEvent::Error(e.to_string()))
-            .await;
-        let _ = event_tx.send(TranscriptionEvent::Shutdown).await;
-        return;
+    let dependencies = [
+        ("streamlink", "Install with: pip install streamlink"),
+        ("ffmpeg", "Install from: https://ffmpeg.org/download.html"),
+    ];
+    for (cmd, hint) in dependencies {
+        if let Err(e) = check_dependency(cmd, hint) {
+            error!("{}", e);
+            let _ = event_tx
+                .send(TranscriptionEvent::Error(e.to_string()))
+                .await;
+            let _ = event_tx.send(TranscriptionEvent::Shutdown).await;
+            return;
+        }
     }
 
     let mut backoff = INITIAL_BACKOFF;
@@ -495,8 +491,7 @@ async fn send_audio_to_deepgram(
 
             _ = shutdown_rx.changed() => {
                 debug!("Audio sender received shutdown signal");
-                let close_msg = serde_json::json!({"type": "CloseStream"});
-                let _ = ws_sink.send(Message::Text(close_msg.to_string())).await;
+                let _ = ws_sink.send(Message::Text(CLOSE_STREAM_MSG.to_string())).await;
                 break;
             }
 
@@ -505,8 +500,7 @@ async fn send_audio_to_deepgram(
                     Ok(0) => {
                         // EOF: stream ended or ffmpeg exited
                         info!("ffmpeg stdout EOF (stream may have ended)");
-                        let close_msg = serde_json::json!({"type": "CloseStream"});
-                        let _ = ws_sink.send(Message::Text(close_msg.to_string())).await;
+                        let _ = ws_sink.send(Message::Text(CLOSE_STREAM_MSG.to_string())).await;
                         break;
                     }
                     Ok(n) => {

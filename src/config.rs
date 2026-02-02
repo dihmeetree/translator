@@ -56,12 +56,6 @@ pub struct Config {
     /// Defaults to 3000. The web UI is always started and serves the
     /// live translation dashboard at `http://localhost:{web_port}`.
     pub web_port: u16,
-
-    /// Timeout in seconds for the IRC WebSocket read loop.
-    /// If no message is received within this duration, a keepalive PING is sent.
-    /// Lower values detect dead connections faster but generate more keepalive traffic.
-    /// Defaults to 300 seconds (5 minutes).
-    pub irc_timeout_secs: u64,
 }
 
 impl Config {
@@ -136,11 +130,6 @@ impl Config {
             .parse()
             .context("WEB_PORT must be a valid port number")?;
 
-        let irc_timeout_secs: u64 = std::env::var("IRC_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "300".to_string())
-            .parse()
-            .context("IRC_TIMEOUT_SECS must be a valid positive number")?;
-
         Ok(Config {
             channel,
             oauth_token,
@@ -154,7 +143,6 @@ impl Config {
             deepgram_model,
             stt_language,
             web_port,
-            irc_timeout_secs,
         })
     }
 }

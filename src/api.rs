@@ -81,15 +81,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     // Get host from environment or use default (127.0.0.1 for local, 0.0.0.0 for Docker)
-    let host: [u8; 4] = std::env::var("HOST")
-        .map(|h| {
-            if h == "0.0.0.0" {
-                [0, 0, 0, 0]
-            } else {
-                [127, 0, 0, 1]
-            }
-        })
-        .unwrap_or([127, 0, 0, 1]);
+    let host: std::net::Ipv4Addr = std::env::var("HOST")
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+        .parse()
+        .map_err(|e| anyhow::anyhow!("HOST must be a valid IPv4 address: {}", e))?;
 
     // Get port from environment or use default
     let port: u16 = std::env::var("PORT")

@@ -34,11 +34,6 @@ use tracing::{info, warn};
 /// New WebSocket clients receive this history on connect.
 const REPLAY_BUFFER_SIZE: usize = 100;
 
-/// Maximum total byte size of the replay buffer (1 MB).
-/// When exceeded, oldest events are evicted regardless of count.
-/// Prevents memory exhaustion from a few very large serialized events.
-const REPLAY_BUFFER_MAX_BYTES: usize = 1024 * 1024;
-
 /// Command sent from web handlers to the TwitchClient event loop.
 #[derive(Debug)]
 pub enum ControlCommand {
@@ -54,57 +49,9 @@ struct WebState {
     /// The Twitch channel name (without #), mutable to support runtime switching.
     channel: RwLock<String>,
     /// Ring buffer of recent events for replay on new connections.
-    recent_events: RwLock<ReplayBuffer>,
+    recent_events: RwLock<VecDeque<String>>,
     /// Sender for control commands to the TwitchClient event loop.
     control_tx: mpsc::Sender<ControlCommand>,
-}
-
-/// Ring buffer that tracks both event count and total byte size.
-///
-/// Evicts oldest events when either the count limit or byte limit is exceeded,
-/// preventing unbounded memory growth from large serialized events.
-struct ReplayBuffer {
-    /// The buffered JSON event strings.
-    events: VecDeque<String>,
-    /// Running total of bytes across all buffered events.
-    total_bytes: usize,
-}
-
-impl ReplayBuffer {
-    /// Creates a new replay buffer pre-allocated for the expected capacity.
-    fn new() -> Self {
-        Self {
-            events: VecDeque::with_capacity(REPLAY_BUFFER_SIZE),
-            total_bytes: 0,
-        }
-    }
-
-    /// Pushes a new event into the buffer, evicting old events if either
-    /// the count limit or byte size limit is exceeded.
-    fn push(&mut self, json: String) {
-        self.total_bytes += json.len();
-        self.events.push_back(json);
-
-        // Evict oldest until both limits are satisfied
-        while self.events.len() > REPLAY_BUFFER_SIZE || self.total_bytes > REPLAY_BUFFER_MAX_BYTES {
-            if let Some(removed) = self.events.pop_front() {
-                self.total_bytes -= removed.len();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Clears all buffered events.
-    fn clear(&mut self) {
-        self.events.clear();
-        self.total_bytes = 0;
-    }
-
-    /// Returns a snapshot of all buffered event JSON strings.
-    fn snapshot(&self) -> Vec<String> {
-        self.events.iter().cloned().collect()
-    }
 }
 
 /// Response from the `/api/config` endpoint.
@@ -141,7 +88,7 @@ pub fn start_web_server(
     let state = Arc::new(WebState {
         event_tx: event_tx.clone(),
         channel: RwLock::new(channel),
-        recent_events: RwLock::new(ReplayBuffer::new()),
+        recent_events: RwLock::new(VecDeque::with_capacity(REPLAY_BUFFER_SIZE)),
         control_tx,
     });
 
@@ -154,7 +101,10 @@ pub fn start_web_server(
                 Ok(event) => {
                     if let Ok(json) = serde_json::to_string(&event) {
                         let mut buf = buffer_state.recent_events.write().await;
-                        buf.push(json);
+                        if buf.len() >= REPLAY_BUFFER_SIZE {
+                            buf.pop_front();
+                        }
+                        buf.push_back(json);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -243,7 +193,10 @@ async fn switch_channel_handler(
     }
 
     // Clear the replay buffer so new clients don't see old channel's messages
-    state.recent_events.write().await.clear();
+    {
+        let mut buf = state.recent_events.write().await;
+        buf.clear();
+    }
 
     // Send the switch command to the TwitchClient event loop.
     // The TwitchClient broadcasts ChannelChanged after completing the PART/JOIN.
@@ -271,7 +224,7 @@ async fn switch_channel_handler(
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
     // Subscribe before snapshotting to avoid a gap between replay and live
     let rx = state.event_tx.subscribe();
-    let replay: Vec<String> = state.recent_events.read().await.snapshot();
+    let replay: Vec<String> = state.recent_events.read().await.iter().cloned().collect();
     ws.on_upgrade(move |socket| handle_ws_connection(socket, rx, replay))
 }
 

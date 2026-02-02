@@ -126,6 +126,8 @@
     padding:8px;
     min-height:0;
     position:relative;
+    contain:layout style;
+    will-change:scroll-position;
   }
   .panel-body::-webkit-scrollbar{width:6px}
   .panel-body::-webkit-scrollbar-track{background:transparent}
@@ -141,6 +143,9 @@
     border:1px solid var(--border);
     border-radius:8px;
     line-height:1.3;
+    contain:content;
+    content-visibility:auto;
+    contain-intrinsic-size:auto 80px;
   }
   .msg:hover{background:#1e1e24;border-color:#3a3a44}
 
@@ -184,12 +189,26 @@
   }
   .romanization{color:var(--text-dim)}
   .translation{color:var(--green)}
-  .lang-tag{
+  .icon{
     display:inline-block;
-    font-size:16px;
-    font-weight:700;
-    color:var(--magenta);
+    width:16px;height:16px;
+    vertical-align:-2px;
     margin-right:4px;
+    -webkit-mask-size:contain;
+    mask-size:contain;
+    -webkit-mask-repeat:no-repeat;
+    mask-repeat:no-repeat;
+    -webkit-mask-position:center;
+    mask-position:center;
+    background-color:currentColor;
+  }
+  .icon-music{
+    -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 18V5l12-2v13'/%3E%3Ccircle cx='6' cy='18' r='3'/%3E%3Ccircle cx='18' cy='16' r='3'/%3E%3C/svg%3E");
+    mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 18V5l12-2v13'/%3E%3Ccircle cx='6' cy='18' r='3'/%3E%3Ccircle cx='18' cy='16' r='3'/%3E%3C/svg%3E");
+  }
+  .icon-globe{
+    -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E");
+    mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E");
   }
 
   /* ── Transcription Entry ────────────────── */
@@ -200,6 +219,9 @@
     border:1px solid var(--border);
     border-radius:8px;
     line-height:1.3;
+    contain:content;
+    content-visibility:auto;
+    contain-intrinsic-size:auto 80px;
   }
   .stt:hover{background:#1e1e24;border-color:#3a3a44}
   .stt-header{display:flex;align-items:center;gap:10px;margin-bottom:6px}
@@ -339,13 +361,18 @@
   const MAX_MESSAGES = 100;
   const RECONNECT_MIN = 1000;
   const RECONNECT_MAX = 30000;
+  const RENDER_BATCH_MS = 16; // ~1 frame at 60fps
 
   // ── State ────────────────────────────────
   let ws = null;
   let reconnectDelay = RECONNECT_MIN;
   let reconnectTimer = null;
+  let chatEmptyVisible = true;
+  let sttEmptyVisible = true;
+  let chatChildCount = 0;
+  let sttChildCount = 0;
 
-  // ── DOM refs ─────────────────────────────
+  // ── DOM refs (cached once) ───────────────
   const statusDot = document.getElementById('statusDot');
   const channelNameEl = document.getElementById('channelName');
   const chatBody = document.getElementById('chatBody');
@@ -356,22 +383,51 @@
   const channelInput = document.getElementById('channelInput');
   const channelBtn = document.getElementById('channelBtn');
 
+  // ── HTML escape via regex (avoids DOM element creation per call) ──
+  const ESC_MAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+  const ESC_RE = /[&<>"']/g;
+  function esc(s){
+    return s.replace(ESC_RE, function(c){ return ESC_MAP[c]; });
+  }
+
+  // ── Color generation with LRU cache ──────
+  const COLOR_PALETTE = [
+    '#ff0000','#00ff00','#0000ff','#ffff00','#ff00ff','#00ffff',
+    '#ff7f00','#7fff00','#ff007f','#007fff','#7f00ff','#ff7f7f'
+  ];
+  const colorCache = new Map();
+  const COLOR_CACHE_MAX = 512;
+  function generateColor(name){
+    let c = colorCache.get(name);
+    if(c !== undefined) return c;
+    let h = 0;
+    for(let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
+    c = COLOR_PALETTE[Math.abs(h) % COLOR_PALETTE.length];
+    if(colorCache.size >= COLOR_CACHE_MAX){
+      // Evict oldest entry
+      colorCache.delete(colorCache.keys().next().value);
+    }
+    colorCache.set(name, c);
+    return c;
+  }
+
+  // ── Time formatter (reuse Intl object) ───
+  const timeFmt = new Intl.DateTimeFormat([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
   // ── Fetch config and init ────────────────
   fetch('/api/config')
-    .then(r => r.json())
-    .then(cfg => {
-      if(cfg.channel){
-        channelNameEl.textContent = '#' + cfg.channel;
-      }
+    .then(function(r){ return r.json(); })
+    .then(function(cfg){
+      if(cfg.channel) channelNameEl.textContent = '#' + cfg.channel;
     })
-    .catch(() => {});
+    .catch(function(){});
 
   // ── Mobile tabs ──────────────────────────
   tabBar.addEventListener('click', function(e){
-    const btn = e.target.closest('button[data-tab]');
+    var btn = e.target.closest('button[data-tab]');
     if(!btn) return;
-    const tab = btn.dataset.tab;
-    tabBar.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    var tab = btn.dataset.tab;
+    tabBar.querySelectorAll('button').forEach(function(b){ b.classList.remove('active'); });
     btn.classList.add('active');
     if(tab === 'chat'){
       chatPanel.classList.remove('hidden-mobile');
@@ -387,6 +443,11 @@
     var ch = channelInput.value.trim().toLowerCase();
     if(!ch || !/^[a-z0-9_]{1,25}$/.test(ch)) return;
     channelBtn.disabled = true;
+    // Optimistic UI: update immediately so the user sees instant feedback
+    // instead of waiting for the backend IRC PART/JOIN round-trip.
+    channelNameEl.textContent = '#' + ch;
+    clearPanels();
+    channelInput.value = '';
     fetch('/api/channel', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -394,10 +455,6 @@
     })
     .then(function(r){
       if(!r.ok) throw new Error('Failed');
-      return r.json();
-    })
-    .then(function(){
-      channelInput.value = '';
     })
     .catch(function(){})
     .finally(function(){
@@ -410,72 +467,170 @@
     switchChannel();
   });
 
-  function clearPanels(){
-    // Clear chat panel
-    while(chatBody.firstChild) chatBody.removeChild(chatBody.firstChild);
-    var ce = document.createElement('div');
-    ce.className = 'empty-state';
-    ce.id = 'chatEmpty';
-    ce.innerHTML = '<div class="spinner"></div><span>Waiting for messages...</span>';
-    chatBody.appendChild(ce);
-
-    // Clear STT panel
-    while(sttBody.firstChild) sttBody.removeChild(sttBody.firstChild);
-    var se = document.createElement('div');
-    se.className = 'empty-state';
-    se.id = 'sttEmpty';
-    se.innerHTML = '<div class="spinner"></div><span>Waiting for audio...</span>';
-    sttBody.appendChild(se);
-
-    chatBuffer.length = 0;
-    sttBuffer.length = 0;
+  // ── Empty-state creation helper ──────────
+  function makeEmptyState(id, text){
+    var el = document.createElement('div');
+    el.className = 'empty-state';
+    el.id = id;
+    el.innerHTML = '<div class="spinner"></div><span>' + text + '</span>';
+    return el;
   }
 
-  // ── Buffered insert: hold messages while scrolled up, flush on return ──
+  function clearPanels(){
+    // replaceChildren() is faster than removing one-by-one
+    chatBody.replaceChildren(makeEmptyState('chatEmpty', 'Waiting for messages...'));
+    sttBody.replaceChildren(makeEmptyState('sttEmpty', 'Waiting for audio...'));
+    chatEmptyVisible = true;
+    sttEmptyVisible = true;
+    chatChildCount = 1;
+    sttChildCount = 1;
+    chatBuffer.length = 0;
+    sttBuffer.length = 0;
+    chatRafQueue.length = 0;
+    sttRafQueue.length = 0;
+    chatRafScheduled = false;
+    sttRafScheduled = false;
+  }
+
+  // ── Buffered insert: hold messages while scrolled up ──
   var chatBuffer = [];
   var sttBuffer = [];
 
-  function isAtBottom(el){
+  // ── Scroll detection with cached state ───
+  // column-reverse: scrollTop is 0 (or small negative) when at bottom
+  var chatAtBottom = true;
+  var sttAtBottom = true;
+
+  function checkAtBottom(el){
     return Math.abs(el.scrollTop) < 5;
   }
 
-  function flushBuffer(container, buffer){
-    while(buffer.length){
-      container.prepend(buffer.shift());
-    }
-    capChildren(container);
-  }
-
   chatBody.addEventListener('scroll', function(){
-    if(isAtBottom(chatBody) && chatBuffer.length) flushBuffer(chatBody, chatBuffer);
-  });
-  sttBody.addEventListener('scroll', function(){
-    if(isAtBottom(sttBody) && sttBuffer.length) flushBuffer(sttBody, sttBuffer);
-  });
+    chatAtBottom = checkAtBottom(chatBody);
+    if(chatAtBottom && chatBuffer.length) flushBuffer(chatBody, chatBuffer, true);
+  }, {passive:true});
 
-  // ── Cap oldest messages (lastChild = visually top in column-reverse) ──
-  function capChildren(parent){
-    while(parent.children.length > MAX_MESSAGES){
+  sttBody.addEventListener('scroll', function(){
+    sttAtBottom = checkAtBottom(sttBody);
+    if(sttAtBottom && sttBuffer.length) flushBuffer(sttBody, sttBuffer, false);
+  }, {passive:true});
+
+  // ── Cap oldest messages using tracked count ──
+  function capChildren(parent, isChat){
+    // Use tracked count instead of querying parent.children.length
+    var count = isChat ? chatChildCount : sttChildCount;
+    while(count > MAX_MESSAGES){
       parent.removeChild(parent.lastChild);
+      count--;
+    }
+    if(isChat) chatChildCount = count;
+    else sttChildCount = count;
+  }
+
+  // ── Flush buffer using DocumentFragment ──
+  function flushBuffer(container, buffer, isChat){
+    if(!buffer.length) return;
+    // Prepend all buffered elements at once via fragment
+    var frag = document.createDocumentFragment();
+    for(var i = 0; i < buffer.length; i++){
+      frag.appendChild(buffer[i]);
+    }
+    if(isChat) chatChildCount += buffer.length;
+    else sttChildCount += buffer.length;
+    buffer.length = 0;
+    container.prepend(frag);
+    capChildren(container, isChat);
+  }
+
+  // ── RAF batching: coalesce rapid WS messages into single frame ──
+  var chatRafQueue = [];
+  var sttRafQueue = [];
+  var chatRafScheduled = false;
+  var sttRafScheduled = false;
+
+  function scheduleChatFlush(){
+    if(chatRafScheduled) return;
+    chatRafScheduled = true;
+    requestAnimationFrame(flushChatRaf);
+  }
+
+  function scheduleSttFlush(){
+    if(sttRafScheduled) return;
+    sttRafScheduled = true;
+    requestAnimationFrame(flushSttRaf);
+  }
+
+  function flushChatRaf(){
+    chatRafScheduled = false;
+    if(!chatRafQueue.length) return;
+    // Remove empty-state on first real message
+    if(chatEmptyVisible){
+      var ce = document.getElementById('chatEmpty');
+      if(ce) ce.remove();
+      chatEmptyVisible = false;
+      chatChildCount--;
+    }
+    if(chatAtBottom){
+      // Batch all queued elements into a single DOM operation
+      var frag = document.createDocumentFragment();
+      for(var i = 0; i < chatRafQueue.length; i++){
+        frag.appendChild(chatRafQueue[i]);
+      }
+      chatChildCount += chatRafQueue.length;
+      chatRafQueue.length = 0;
+      chatBody.prepend(frag);
+      capChildren(chatBody, true);
+    } else {
+      // Push to scroll-locked buffer
+      for(var j = 0; j < chatRafQueue.length; j++){
+        chatBuffer.push(chatRafQueue[j]);
+      }
+      chatRafQueue.length = 0;
     }
   }
 
-  // ── Escape HTML ──────────────────────────
-  function esc(s){
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
+  function flushSttRaf(){
+    sttRafScheduled = false;
+    if(!sttRafQueue.length) return;
+    if(sttEmptyVisible){
+      var se = document.getElementById('sttEmpty');
+      if(se) se.remove();
+      sttEmptyVisible = false;
+      sttChildCount--;
+    }
+    if(sttAtBottom){
+      var frag = document.createDocumentFragment();
+      for(var i = 0; i < sttRafQueue.length; i++){
+        frag.appendChild(sttRafQueue[i]);
+      }
+      sttChildCount += sttRafQueue.length;
+      sttRafQueue.length = 0;
+      sttBody.prepend(frag);
+      capChildren(sttBody, false);
+    } else {
+      for(var j = 0; j < sttRafQueue.length; j++){
+        sttBuffer.push(sttRafQueue[j]);
+      }
+      sttRafQueue.length = 0;
+    }
+  }
+
+  // ── Build translation block HTML (shared by chat + stt) ──
+  function buildTranslationHtml(msg, cssClass){
+    var html = '<div class="' + cssClass + '">';
+    if(msg.romanization){
+      html += '<div class="romanization"><span class="icon icon-music"></span>' + esc(msg.romanization) + '</div>';
+    }
+    html += '<div class="translation"><span class="icon icon-globe"></span>' + esc(msg.translation) + '</div></div>';
+    return html;
   }
 
   // ── Render chat message ──────────────────
   function renderChat(msg){
-    var ce = document.getElementById('chatEmpty');
-    if(ce) ce.remove();
-
-    const div = document.createElement('div');
+    var div = document.createElement('div');
     div.className = 'msg';
 
-    let html = '';
+    var html = '';
 
     // Reply context
     if(msg.reply_to){
@@ -486,91 +641,47 @@
 
     // Main line: badges + username + message
     html += '<div class="msg-line">';
-
     if(msg.is_broadcaster) html += '<span class="badge badge-broadcaster">B</span>';
     else if(msg.is_mod) html += '<span class="badge badge-mod">M</span>';
     else if(msg.is_vip) html += '<span class="badge badge-vip">V</span>';
 
-    const color = msg.color || generateColor(msg.username);
+    var color = msg.color || generateColor(msg.username);
     html += '<span class="username" style="color:' + esc(color) + '">'
       + esc(msg.username) + '</span>: '
-      + esc(msg.content);
-    html += '</div>';
+      + esc(msg.content) + '</div>';
 
     // Translation block
-    if(msg.translation){
-      html += '<div class="msg-translation">';
-      if(msg.romanization){
-        html += '<div class="romanization">\u266A ' + esc(msg.romanization) + '</div>';
-      }
-      html += '<div class="translation">';
-      if(msg.language_name){
-        html += '\u21B3 <span class="lang-tag">[' + esc(msg.language_name) + ']</span>';
-      }
-      html += esc(msg.translation) + '</div>';
-      html += '</div>';
-    }
+    if(msg.translation) html += buildTranslationHtml(msg, 'msg-translation');
 
     div.innerHTML = html;
-    if(isAtBottom(chatBody)){
-      chatBody.prepend(div);
-      capChildren(chatBody);
-    } else {
-      chatBuffer.push(div);
-    }
+    chatRafQueue.push(div);
+    scheduleChatFlush();
   }
 
   // ── Render transcription ─────────────────
   function renderStt(msg){
     if(!msg.translation) return;
-    var se = document.getElementById('sttEmpty');
-    if(se) se.remove();
 
-    const div = document.createElement('div');
+    var div = document.createElement('div');
     div.className = 'stt';
 
-    const time = new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    var time = timeFmt.format(new Date(msg.timestamp));
 
-    let html = '<div class="stt-header">'
+    var html = '<div class="stt-header">'
       + '<span class="stt-time">' + esc(time) + '</span>'
       + '</div>';
     html += '<div class="stt-text">' + esc(msg.transcript) + '</div>';
 
-    if(msg.translation){
-      html += '<div class="stt-translation">';
-      if(msg.romanization){
-        html += '<div class="romanization">\u266A ' + esc(msg.romanization) + '</div>';
-      }
-      html += '<div class="translation">';
-      if(msg.language_name){
-        html += '\u21B3 <span class="lang-tag">[' + esc(msg.language_name) + ']</span>';
-      }
-      html += esc(msg.translation) + '</div>';
-      html += '</div>';
-    }
+    if(msg.translation) html += buildTranslationHtml(msg, 'stt-translation');
 
     div.innerHTML = html;
-    if(isAtBottom(sttBody)){
-      sttBody.prepend(div);
-      capChildren(sttBody);
-    } else {
-      sttBuffer.push(div);
-    }
+    sttRafQueue.push(div);
+    scheduleSttFlush();
   }
 
   // ── Helpers ──────────────────────────────
   function truncate(s, max){
     return s.length > max ? s.slice(0, max) + '...' : s;
-  }
-
-  function generateColor(name){
-    let h = 0;
-    for(let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
-    const colors = [
-      '#ff0000','#00ff00','#0000ff','#ffff00','#ff00ff','#00ffff',
-      '#ff7f00','#7fff00','#ff007f','#007fff','#7f00ff','#ff7f7f'
-    ];
-    return colors[Math.abs(h) % colors.length];
   }
 
   // ── WebSocket connection ─────────────────
@@ -582,7 +693,7 @@
     if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     setStatus('connecting');
 
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(proto + '//' + location.host + '/ws');
 
     ws.onopen = function(){
@@ -595,13 +706,11 @@
       scheduleReconnect();
     };
 
-    ws.onerror = function(){
-      // onclose will fire after this
-    };
+    ws.onerror = function(){};
 
     ws.onmessage = function(e){
       try {
-        const event = JSON.parse(e.data);
+        var event = JSON.parse(e.data);
         switch(event.type){
           case 'ChatMessage': renderChat(event); break;
           case 'Transcription': renderStt(event); break;
@@ -610,9 +719,7 @@
             clearPanels();
             break;
         }
-      } catch(err){
-        // Ignore malformed messages
-      }
+      } catch(err){}
     };
   }
 
