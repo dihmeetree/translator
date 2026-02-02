@@ -691,7 +691,14 @@ impl TwitchClient {
             }
             TranscriptionEvent::Error(msg) => {
                 self.clear_interim_transcript();
-                println!("{} {}", "[Audio]".bright_red().bold(), msg.bright_red());
+                println!(
+                    "{} {}",
+                    "[Audio]"
+                        .truecolor(255, 255, 255)
+                        .on_truecolor(200, 30, 30)
+                        .bold(),
+                    msg.bright_red()
+                );
             }
             TranscriptionEvent::Shutdown => {
                 self.clear_interim_transcript();
@@ -718,7 +725,10 @@ impl TwitchClient {
 
         println!(
             "{} {}",
-            "[Audio]".bright_cyan().bold(),
+            "[Audio]"
+                .truecolor(255, 255, 255)
+                .on_truecolor(138, 43, 226)
+                .bold(),
             transcript.bright_white()
         );
 
