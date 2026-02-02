@@ -16,30 +16,33 @@ RUN mkdir src && \
     touch src/lib.rs
 
 # Build dependencies only
-RUN cargo build --release --bin translation-api && \
+RUN cargo build --release 2>/dev/null || true && \
     rm -rf src
 
 # Copy actual source code
 COPY src ./src
 
 # Touch files to invalidate cache and rebuild
-RUN touch src/api.rs && cargo build --release --bin translation-api
+RUN touch src/main.rs && \
+    cargo build --release --bin twitch-translator
 
 # Runtime stage
 FROM alpine:3.23.0
 
-# Install runtime dependencies
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies:
+#   ca-certificates - TLS for outbound HTTPS/WSS connections
+#   ffmpeg          - decodes stream audio to PCM for Deepgram STT
+#   python3 + pip   - required to install streamlink
+#   streamlink      - extracts HLS audio stream from Twitch
+RUN apk add --no-cache ca-certificates ffmpeg python3 py3-pip && \
+    pip3 install --no-cache-dir --break-system-packages streamlink
 
 WORKDIR /app
 
 # Copy the binary from builder
-COPY --from=builder /app/target/release/translation-api /app/translation-api
+COPY --from=builder /app/target/release/twitch-translator /app/twitch-translator
 
-# Default port and host (0.0.0.0 to be accessible from outside container)
-ENV PORT=4000
-ENV HOST=0.0.0.0
+# Web UI port
+EXPOSE 3000
 
-EXPOSE 4000
-
-CMD ["/app/translation-api"]
+CMD ["/app/twitch-translator"]

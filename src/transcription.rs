@@ -97,15 +97,18 @@ type DgWsStream =
 
 /// Verifies that a required external command is installed and accessible on PATH.
 ///
+/// Uses `tokio::process::Command` to avoid blocking the async runtime.
+///
 /// # Errors
 ///
 /// Returns an error with the install hint if the command is not found.
-fn check_dependency(command: &str, install_hint: &str) -> Result<()> {
-    match std::process::Command::new("which")
+async fn check_dependency(command: &str, install_hint: &str) -> Result<()> {
+    match tokio::process::Command::new("which")
         .arg(command)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
+        .await
     {
         Ok(status) if status.success() => Ok(()),
         _ => anyhow::bail!("'{}' not found on PATH. {}", command, install_hint),
@@ -287,7 +290,7 @@ pub async fn run_pipeline(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     // Pre-flight dependency checks
-    if let Err(e) = check_dependency("streamlink", "Install with: pip install streamlink") {
+    if let Err(e) = check_dependency("streamlink", "Install with: pip install streamlink").await {
         error!("{}", e);
         let _ = event_tx
             .send(TranscriptionEvent::Error(e.to_string()))
@@ -295,7 +298,9 @@ pub async fn run_pipeline(
         let _ = event_tx.send(TranscriptionEvent::Shutdown).await;
         return;
     }
-    if let Err(e) = check_dependency("ffmpeg", "Install from: https://ffmpeg.org/download.html") {
+    if let Err(e) =
+        check_dependency("ffmpeg", "Install from: https://ffmpeg.org/download.html").await
+    {
         error!("{}", e);
         let _ = event_tx
             .send(TranscriptionEvent::Error(e.to_string()))

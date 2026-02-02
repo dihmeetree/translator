@@ -155,21 +155,6 @@ impl Translator {
         })
     }
 
-    /// Checks if a translation is cached (will be instant) or requires an API call.
-    ///
-    /// Returns `true` if the translation needs an API call (not cached).
-    /// Returns `false` if cached or doesn't need translation.
-    pub fn needs_api_call(&self, text: &str, source_lang: &str) -> bool {
-        if !needs_translation(text) {
-            return false;
-        }
-
-        let (_, core, _) = extract_ascii_affixes(text);
-        let core_lower = core.to_lowercase();
-
-        self.cache.get(&core_lower, source_lang).is_none()
-    }
-
     /// Translates text to English, returning both translation and romanization.
     ///
     /// Results are cached in a persistent SQLite database to avoid redundant API calls.

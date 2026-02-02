@@ -3,19 +3,21 @@
 //! Handles connecting to Twitch chat via IRC over WebSocket and processing messages.
 
 use crate::config::Config;
+use crate::events::{
+    self, ChannelChangedEvent, ChatMessageEvent, ReplyContext, TranscriptionMessageEvent, WebEvent,
+};
 use crate::transcription::{TranscriptionConfig, TranscriptionEvent};
-use crate::translator::Translator;
+use crate::translator::{TranslationResult, Translator};
+use crate::web::ControlCommand;
 use any_ascii::any_ascii;
 use anyhow::{Context, Result};
 use colored::Colorize;
-use crossterm::{cursor, execute, terminal};
 use futures_util::{SinkExt, StreamExt};
-use std::io::stdout;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use terminal_size::{terminal_size, Width};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -35,6 +37,20 @@ pub struct TwitchClient {
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+
+    /// Broadcast sender for WebSocket event distribution.
+    /// Each outgoing event is sent to all connected web UI clients.
+    /// If no subscribers exist, sends are silently dropped.
+    event_tx: broadcast::Sender<WebEvent>,
+
+    /// Generation counter incremented on each channel switch.
+    /// Spawned tasks capture the current value and skip broadcasting
+    /// if the generation has changed, preventing stale events from
+    /// the old channel appearing after a switch.
+    generation: Arc<AtomicU64>,
+
+    /// Receiver for control commands from the web UI (e.g., channel switching).
+    control_rx: mpsc::Receiver<ControlCommand>,
 
     /// Receiver for transcription events (None if transcription disabled).
     stt_rx: Option<mpsc::Receiver<TranscriptionEvent>>,
@@ -115,6 +131,8 @@ enum LoopAction {
     SttClosed,
     /// An interim transcript has been sitting for too long without being finalized.
     SttInterimTimeout,
+    /// A control command was received from the web UI (e.g., switch channel).
+    SwitchChannel(String),
 }
 
 impl TwitchClient {
@@ -124,7 +142,14 @@ impl TwitchClient {
     ///
     /// * `config` - Application configuration including channel and credentials.
     /// * `translator` - Translation service for non-English messages.
-    pub async fn new(config: Config, translator: Translator) -> Result<Self> {
+    /// * `event_tx` - Broadcast sender for distributing events to web UI clients.
+    /// * `control_rx` - Receiver for control commands from the web UI.
+    pub async fn new(
+        config: Config,
+        translator: Translator,
+        event_tx: broadcast::Sender<WebEvent>,
+        control_rx: mpsc::Receiver<ControlCommand>,
+    ) -> Result<Self> {
         info!("Connecting to Twitch IRC...");
 
         let (ws_stream, _) = connect_async(TWITCH_IRC_WSS)
@@ -135,6 +160,9 @@ impl TwitchClient {
             config: config.clone(),
             translator,
             ws_stream,
+            event_tx,
+            generation: Arc::new(AtomicU64::new(0)),
+            control_rx,
             stt_rx: None,
             stt_shutdown_tx: None,
             current_interim: None,
@@ -225,6 +253,8 @@ impl TwitchClient {
         print_thick_divider();
         println!("{}", "Waiting for messages...".bright_black().italic());
 
+        let irc_timeout = Duration::from_secs(self.config.irc_timeout_secs);
+
         loop {
             // Produce a LoopAction from select! without holding &mut self borrows,
             // then handle it separately to allow full &mut self access.
@@ -234,7 +264,7 @@ impl TwitchClient {
 
             let action = if let Some(ref mut stt_rx) = self.stt_rx {
                 tokio::select! {
-                    ws_result = timeout(Duration::from_secs(300), self.ws_stream.next()) => {
+                    ws_result = timeout(irc_timeout, self.ws_stream.next()) => {
                         match ws_result {
                             Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
                             Ok(Some(Ok(_))) => continue,
@@ -258,14 +288,30 @@ impl TwitchClient {
                     } => {
                         LoopAction::SttInterimTimeout
                     }
+                    cmd = self.control_rx.recv() => {
+                        match cmd {
+                            Some(ControlCommand::SwitchChannel(ch)) => LoopAction::SwitchChannel(ch),
+                            None => continue,
+                        }
+                    }
                 }
             } else {
-                match timeout(Duration::from_secs(300), self.ws_stream.next()).await {
-                    Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
-                    Ok(Some(Ok(_))) => continue,
-                    Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
-                    Ok(None) => LoopAction::IrcClosed,
-                    Err(_) => LoopAction::IrcTimeout,
+                tokio::select! {
+                    ws_result = timeout(irc_timeout, self.ws_stream.next()) => {
+                        match ws_result {
+                            Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
+                            Ok(Some(Ok(_))) => continue,
+                            Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
+                            Ok(None) => LoopAction::IrcClosed,
+                            Err(_) => LoopAction::IrcTimeout,
+                        }
+                    }
+                    cmd = self.control_rx.recv() => {
+                        match cmd {
+                            Some(ControlCommand::SwitchChannel(ch)) => LoopAction::SwitchChannel(ch),
+                            None => continue,
+                        }
+                    }
                 }
             };
 
@@ -288,7 +334,7 @@ impl TwitchClient {
                     self.send_raw("PING :tmi.twitch.tv").await?;
                 }
                 LoopAction::SttEvent(event) => {
-                    self.handle_transcription_event(event).await;
+                    self.handle_transcription_event(event);
                 }
                 LoopAction::SttClosed => {
                     warn!("Transcription channel closed");
@@ -301,8 +347,11 @@ impl TwitchClient {
                         debug!("Auto-committing stale interim: {}", transcript);
                         self.clear_interim_transcript();
                         self.last_final_transcript = Some(transcript.clone());
-                        self.display_final_transcript(&transcript, 0.0).await;
+                        self.display_final_transcript(&transcript, 0.0);
                     }
+                }
+                LoopAction::SwitchChannel(new_channel) => {
+                    self.handle_channel_switch(&new_channel).await?;
                 }
             }
         }
@@ -327,7 +376,7 @@ impl TwitchClient {
 
         // Parse PRIVMSG (chat messages)
         if let Some(chat_msg) = self.parse_privmsg(line) {
-            self.process_chat_message(chat_msg).await;
+            self.process_chat_message(chat_msg);
         }
 
         Ok(())
@@ -435,225 +484,90 @@ impl TwitchClient {
         })
     }
 
-    /// Processes a chat message, detecting language and translating if needed.
-    async fn process_chat_message(&mut self, msg: ChatMessage) {
-        let display = msg
-            .display_name
-            .as_ref()
-            .unwrap_or(&msg.username)
-            .to_string();
-
-        // Build badge prefix
-        let badge_prefix = build_badge_prefix(msg.is_broadcaster, msg.is_mod, msg.is_vip);
-
+    /// Processes a chat message by spawning translation as a background task.
+    ///
+    /// The message is immediately dispatched to a spawned task that handles
+    /// language detection, translation, terminal display, and WebSocket broadcast.
+    /// This keeps the main event loop free to process the next IRC or STT event
+    /// without waiting for the translation API.
+    fn process_chat_message(&mut self, msg: ChatMessage) {
         // Reset interim state so a stale timeout doesn't fire during chat output
         self.clear_interim_transcript();
 
-        // Print divider before each message
-        print_divider();
+        let translator = self.translator.clone();
+        let event_tx = self.event_tx.clone();
+        let generation = Arc::clone(&self.generation);
+        let gen_at_spawn = generation.load(Ordering::Relaxed);
+        let config_default_lang = self.config.default_language.clone();
+        let config_threshold = self.config.detection_confidence_threshold;
 
-        // Display reply context if this is a reply
-        if let Some(ref reply) = msg.reply_to {
-            self.display_reply_context(reply);
-        }
+        tokio::spawn(async move {
+            let display = msg
+                .display_name
+                .as_ref()
+                .unwrap_or(&msg.username)
+                .to_string();
 
-        // Check if a default language is set - if so, translate all messages
-        if let Some(ref default_lang) = self.config.default_language {
-            self.display_message_with_forced_translation(
-                &badge_prefix,
-                &display,
+            let badge_prefix = build_badge_prefix(msg.is_broadcaster, msg.is_mod, msg.is_vip);
+
+            // Print divider before each message
+            print_divider();
+
+            // Display reply context if this is a reply
+            if let Some(ref reply) = msg.reply_to {
+                display_reply_context(reply);
+            }
+
+            // Detect language and translate if non-English
+            let (source_lang, lang_name, translation_result) = detect_and_translate(
+                &translator,
                 &msg.content,
-                &msg.color,
-                default_lang,
+                &config_default_lang,
+                config_threshold,
             )
             .await;
-            return;
-        }
 
-        // Detect language
-        let detection = self.translator.detect_language(&msg.content);
-
-        match detection {
-            Some(ref det)
-                if !det.is_english
-                    && det.confidence >= self.config.detection_confidence_threshold =>
-            {
-                // Non-English message detected - translate it
-                self.display_message_with_translation(
-                    &badge_prefix,
-                    &display,
-                    &msg.content,
-                    &msg.color,
-                    det,
-                )
-                .await;
-            }
-            _ => {
-                // English or low confidence - just display normally
-                self.display_message(&badge_prefix, &display, &msg.content, &msg.color);
-            }
-        }
-    }
-
-    /// Displays the context of a reply (the message being replied to).
-    fn display_reply_context(&self, reply: &ReplyInfo) {
-        // Truncate long messages (by character count, not bytes)
-        let max_chars = 50;
-        let truncated_body: String = if reply.parent_msg_body.chars().count() > max_chars {
-            let truncated: String = reply.parent_msg_body.chars().take(max_chars).collect();
-            format!("{}...", truncated)
-        } else {
-            reply.parent_msg_body.clone()
-        };
-
-        println!(
-            "  {} {} {}",
-            "┌─ replying to".bright_black(),
-            reply.parent_display_name.bright_blue(),
-            format!("\"{}\"", truncated_body).bright_black().italic()
-        );
-    }
-
-    /// Displays a regular chat message with colored output.
-    fn display_message(
-        &self,
-        badge_prefix: &str,
-        username: &str,
-        content: &str,
-        color: &Option<String>,
-    ) {
-        let colored_name = colorize_username(username, color);
-        println!("{}{}: {}", badge_prefix, colored_name, content);
-    }
-
-    /// Displays a message with its translation.
-    async fn display_message_with_translation(
-        &self,
-        badge_prefix: &str,
-        username: &str,
-        content: &str,
-        color: &Option<String>,
-        detection: &crate::translator::DetectionResult,
-    ) {
-        self.display_translated_message(
-            badge_prefix,
-            username,
-            content,
-            color,
-            &detection.language,
-            &detection.language_name,
-        )
-        .await;
-    }
-
-    /// Displays a message with forced translation from a specified source language.
-    ///
-    /// Used when DEFAULT_LANGUAGE is set to translate all messages regardless of detection.
-    async fn display_message_with_forced_translation(
-        &self,
-        badge_prefix: &str,
-        username: &str,
-        content: &str,
-        color: &Option<String>,
-        source_lang: &str,
-    ) {
-        self.display_translated_message(
-            badge_prefix,
-            username,
-            content,
-            color,
-            source_lang,
-            &source_lang.to_uppercase(),
-        )
-        .await;
-    }
-
-    /// Displays a message with translation, showing romanization and translated text.
-    ///
-    /// This is the core display function used by both auto-detected and forced translations.
-    async fn display_translated_message(
-        &self,
-        badge_prefix: &str,
-        username: &str,
-        content: &str,
-        color: &Option<String>,
-        source_lang: &str,
-        lang_display_name: &str,
-    ) {
-        let colored_name = colorize_username(username, color);
-
-        // Display original message
-        println!(
-            "{}{}: {}",
-            badge_prefix,
-            colored_name,
-            content.bright_white()
-        );
-
-        let lang_indicator = format!("[{}]", lang_display_name);
-
-        // Only show spinner if we need to make an API call (not cached)
-        let needs_api = self.translator.needs_api_call(content, source_lang);
-        let stop_spinner = if needs_api {
-            Some(start_spinner(&lang_indicator))
-        } else {
-            None
-        };
-
-        // Attempt translation (which now includes romanization)
-        let result = self.translator.translate(content, source_lang).await;
-
-        // Stop spinner and clear the line if we started one
-        if let Some(stop_flag) = stop_spinner {
-            stop_flag.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            clear_current_line();
-        }
-
-        match result {
-            Ok(Some(translation_result)) => {
-                // Only show romanization and translation if translation is different from original
-                let has_translation = !translation_result
-                    .translation
-                    .trim()
-                    .eq_ignore_ascii_case(content.trim());
-
-                if has_translation {
-                    // Show romanization (Google's or any_ascii fallback)
-                    if let Some(romanization) =
-                        get_romanization(content, translation_result.romanization.as_deref())
-                    {
-                        println!(
-                            "  {} {}",
-                            "♪".bright_yellow(),
-                            romanization.bright_white().dimmed()
-                        );
-                    }
-
-                    // Display translation with language indicator
-                    let lang_indicator = lang_indicator.bright_magenta().bold();
-
-                    println!(
-                        "  {} {} {}",
-                        "↳".bright_cyan(),
-                        lang_indicator,
-                        translation_result.translation.bright_green().italic()
-                    );
-                }
-            }
-            Ok(None) => {
-                // Text was ASCII-only, no translation needed
-            }
-            Err(e) => {
-                // Show error but don't crash
-                debug!("Translation failed: {}", e);
+            // Terminal display
+            let colored_name = colorize_username(&display, &msg.color);
+            if let Some(ref result) = translation_result {
                 println!(
-                    "  {} {}",
-                    "Error:".bright_red().bold(),
-                    "Message could not be translated.".bright_red()
+                    "{}{}: {}",
+                    badge_prefix,
+                    colored_name,
+                    msg.content.bright_white()
                 );
+                display_translation_result(&msg.content, lang_name.as_deref(), result);
+            } else {
+                println!("{}{}: {}", badge_prefix, colored_name, msg.content);
             }
-        }
+
+            // Skip broadcasting if the channel has changed since this task spawned
+            if generation.load(Ordering::Relaxed) != gen_at_spawn {
+                return;
+            }
+
+            // Broadcast to WebSocket clients
+            let event = ChatMessageEvent {
+                username: display,
+                color: msg.color.clone(),
+                is_broadcaster: msg.is_broadcaster,
+                is_mod: msg.is_mod,
+                is_vip: msg.is_vip,
+                content: msg.content.clone(),
+                translation: translation_result.as_ref().map(|r| r.translation.clone()),
+                romanization: translation_result
+                    .as_ref()
+                    .and_then(|r| r.romanization.clone()),
+                source_language: source_lang,
+                language_name: lang_name,
+                reply_to: msg.reply_to.as_ref().map(|r| ReplyContext {
+                    parent_username: r.parent_display_name.clone(),
+                    parent_message: r.parent_msg_body.clone(),
+                }),
+                timestamp: events::current_timestamp_ms(),
+            };
+            let _ = event_tx.send(WebEvent::ChatMessage(event));
+        });
     }
 
     /// Handles a transcription event from the STT pipeline.
@@ -661,7 +575,7 @@ impl TwitchClient {
     /// Interim results are tracked silently (no terminal output) so we know
     /// speech is active. Final results are displayed with the `[Audio]` prefix
     /// and passed through the translation pipeline.
-    async fn handle_transcription_event(&mut self, event: TranscriptionEvent) {
+    fn handle_transcription_event(&mut self, event: TranscriptionEvent) {
         match event {
             TranscriptionEvent::Interim { transcript } => {
                 // Track the interim silently — no terminal output.
@@ -686,7 +600,7 @@ impl TwitchClient {
                 } else {
                     self.clear_interim_transcript();
                     self.last_final_transcript = Some(transcript.clone());
-                    self.display_final_transcript(&transcript, confidence).await;
+                    self.display_final_transcript(&transcript, confidence);
                 }
             }
             TranscriptionEvent::Error(msg) => {
@@ -716,86 +630,262 @@ impl TwitchClient {
         self.interim_set_at = None;
     }
 
-    /// Displays a finalized transcript and optionally translates it.
+    /// Switches to a new Twitch channel at runtime.
     ///
-    /// Shows the transcript with `[Audio]` prefix and a visual divider,
-    /// then runs it through the translation pipeline if non-English.
-    async fn display_final_transcript(&self, transcript: &str, _confidence: f64) {
-        print_divider();
+    /// Parts the old IRC channel, joins the new one, updates config,
+    /// resets transcript state, and restarts the transcription pipeline
+    /// if it was active.
+    async fn handle_channel_switch(&mut self, new_channel: &str) -> Result<()> {
+        let old_channel = self.config.channel.clone();
+        info!("Switching channel: #{} -> #{}", old_channel, new_channel);
 
+        // Bump generation so in-flight spawned tasks from the old channel
+        // skip broadcasting their results.
+        self.generation.fetch_add(1, Ordering::Relaxed);
+
+        // PART the old IRC channel
+        self.send_raw(&format!("PART #{}", old_channel)).await?;
+
+        // Update the channel in config
+        self.config.channel = new_channel.to_string();
+
+        // JOIN the new IRC channel
+        self.send_raw(&format!("JOIN #{}", self.config.channel))
+            .await?;
+
+        // Reset transcript state
+        self.clear_interim_transcript();
+        self.last_final_transcript = None;
+
+        // Restart the transcription pipeline if it was active
+        if self.stt_shutdown_tx.is_some() {
+            self.restart_transcription_pipeline();
+        }
+
+        // Broadcast ChannelChanged to WebSocket clients now that the switch is done
+        let event = WebEvent::ChannelChanged(ChannelChangedEvent {
+            channel: self.config.channel.clone(),
+            timestamp: events::current_timestamp_ms(),
+        });
+        let _ = self.event_tx.send(event);
+
+        info!("Now listening on #{}", self.config.channel);
+        print_thick_divider();
         println!(
-            "{} {}",
-            "[Audio]"
-                .truecolor(255, 255, 255)
-                .on_truecolor(138, 43, 226)
-                .bold(),
-            transcript.bright_white()
+            "{}",
+            format!(
+                "Switched to #{} - waiting for messages...",
+                self.config.channel
+            )
+            .bright_green()
+            .bold()
         );
 
-        // Run through translation pipeline (same logic as chat messages)
-        if let Some(ref default_lang) = self.config.default_language {
-            self.display_stt_translation(transcript, default_lang).await;
-        } else {
-            let detection = self.translator.detect_language(transcript);
-            if let Some(ref det) = detection {
-                if !det.is_english && det.confidence >= self.config.detection_confidence_threshold {
-                    self.display_stt_translation(transcript, &det.language)
-                        .await;
-                }
-            }
+        Ok(())
+    }
+
+    /// Shuts down the current transcription pipeline and starts a new one
+    /// for the current channel.
+    ///
+    /// Signals the old pipeline to shut down via the watch channel, then
+    /// spawns a fresh pipeline with the updated channel name.
+    fn restart_transcription_pipeline(&mut self) {
+        // Signal the old pipeline to shut down
+        if let Some(ref shutdown_tx) = self.stt_shutdown_tx {
+            let _ = shutdown_tx.send(true);
+        }
+        self.stt_shutdown_tx = None;
+        self.stt_rx = None;
+
+        // Start a new pipeline for the new channel
+        if let Some(ref api_key) = self.config.deepgram_api_key {
+            let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>(64);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let stt_config = TranscriptionConfig {
+                api_key: api_key.clone(),
+                channel: self.config.channel.clone(),
+                language: self.config.stt_language.clone(),
+                model: self.config.deepgram_model.clone(),
+            };
+
+            tokio::spawn(crate::transcription::run_pipeline(
+                stt_config,
+                event_tx,
+                shutdown_rx,
+            ));
+
+            self.stt_rx = Some(event_rx);
+            self.stt_shutdown_tx = Some(shutdown_tx);
+
+            info!(
+                "Restarted transcription pipeline for #{}",
+                self.config.channel
+            );
         }
     }
 
-    /// Translates an STT transcript and displays the romanization and translation.
+    /// Spawns a background task to display and broadcast a finalized transcript.
     ///
-    /// Shows a spinner while waiting for the translation API, matching the
-    /// visual behavior of chat message translations.
-    async fn display_stt_translation(&self, text: &str, source_lang: &str) {
-        let lang_indicator = format!("[{}]", source_lang.to_uppercase());
+    /// Shows the transcript with `[Audio]` prefix and a visual divider,
+    /// then runs it through the translation pipeline if non-English.
+    /// Also broadcasts a [`WebEvent::Transcription`] to WebSocket clients.
+    ///
+    /// Runs in a spawned task so the main event loop is not blocked by
+    /// translation API calls, allowing chat and audio to process in parallel.
+    fn display_final_transcript(&self, transcript: &str, _confidence: f64) {
+        let translator = self.translator.clone();
+        let event_tx = self.event_tx.clone();
+        let generation = Arc::clone(&self.generation);
+        let gen_at_spawn = generation.load(Ordering::Relaxed);
+        let config_default_lang = self.config.default_language.clone();
+        let config_threshold = self.config.detection_confidence_threshold;
+        let transcript = transcript.to_string();
 
-        // Show spinner only when an API call is needed (not cached)
-        let needs_api = self.translator.needs_api_call(text, source_lang);
-        let stop_spinner = if needs_api {
-            Some(start_spinner(&lang_indicator))
-        } else {
-            None
-        };
+        tokio::spawn(async move {
+            print_divider();
 
-        let result = self.translator.translate(text, source_lang).await;
+            println!(
+                "{} {}",
+                "[Audio]"
+                    .truecolor(255, 255, 255)
+                    .on_truecolor(138, 43, 226)
+                    .bold(),
+                transcript.bright_white()
+            );
 
-        // Stop spinner and clear its line if we started one
-        if let Some(stop_flag) = stop_spinner {
-            stop_flag.store(true, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            clear_current_line();
+            // Detect language and translate if non-English
+            let (source_lang, lang_name, translation_result) = detect_and_translate(
+                &translator,
+                &transcript,
+                &config_default_lang,
+                config_threshold,
+            )
+            .await;
+
+            // Terminal display of translation
+            if let Some(ref result) = translation_result {
+                display_translation_result(&transcript, lang_name.as_deref(), result);
+            }
+
+            // Skip broadcasting if the channel has changed since this task spawned
+            if generation.load(Ordering::Relaxed) != gen_at_spawn {
+                return;
+            }
+
+            // Broadcast to WebSocket clients
+            let event = TranscriptionMessageEvent {
+                transcript: transcript.clone(),
+                translation: translation_result.as_ref().map(|r| r.translation.clone()),
+                romanization: translation_result
+                    .as_ref()
+                    .and_then(|r| r.romanization.clone()),
+                source_language: source_lang,
+                language_name: lang_name,
+                timestamp: events::current_timestamp_ms(),
+            };
+            let _ = event_tx.send(WebEvent::Transcription(event));
+        });
+    }
+}
+
+/// Detects the language of the given text and translates it if non-English.
+///
+/// Handles both "forced language" mode (when `default_lang` is set) and
+/// auto-detection mode. Returns a tuple of `(source_lang, lang_name, translation_result)`.
+async fn detect_and_translate(
+    translator: &Translator,
+    text: &str,
+    default_lang: &Option<String>,
+    confidence_threshold: f64,
+) -> (Option<String>, Option<String>, Option<TranslationResult>) {
+    if let Some(ref lang) = *default_lang {
+        let result = translate_for_display(translator, text, lang).await;
+        (Some(lang.clone()), Some(lang.to_uppercase()), result)
+    } else {
+        let detection = translator.detect_language(text);
+        match detection {
+            Some(ref det) if !det.is_english && det.confidence >= confidence_threshold => {
+                let result = translate_for_display(translator, text, &det.language).await;
+                (
+                    Some(det.language.clone()),
+                    Some(det.language_name.clone()),
+                    result,
+                )
+            }
+            _ => (None, None, None),
         }
+    }
+}
 
-        match result {
-            Ok(Some(result)) => {
-                let has_translation = !result.translation.trim().eq_ignore_ascii_case(text.trim());
+/// Prints the translation result (romanization + translated text) to the terminal.
+///
+/// Shows nothing if the translation is identical to the source text (case-insensitive).
+fn display_translation_result(
+    source_text: &str,
+    lang_name: Option<&str>,
+    result: &TranslationResult,
+) {
+    let has_translation = !result
+        .translation
+        .trim()
+        .eq_ignore_ascii_case(source_text.trim());
+    if has_translation {
+        if let Some(romanization) = get_romanization(source_text, result.romanization.as_deref()) {
+            println!(
+                "  {} {}",
+                "♪".bright_yellow(),
+                romanization.bright_white().dimmed()
+            );
+        }
+        let lang_indicator = format!("[{}]", lang_name.unwrap_or("?"))
+            .bright_magenta()
+            .bold();
+        println!(
+            "  {} {} {}",
+            "↳".bright_cyan(),
+            lang_indicator,
+            result.translation.bright_green().italic()
+        );
+    }
+}
 
-                if has_translation {
-                    if let Some(romanization) =
-                        get_romanization(text, result.romanization.as_deref())
-                    {
-                        println!(
-                            "  {} {}",
-                            "♪".bright_yellow(),
-                            romanization.bright_white().dimmed()
-                        );
-                    }
-                    println!(
-                        "  {} {} {}",
-                        "↳".bright_cyan(),
-                        lang_indicator.bright_magenta().bold(),
-                        result.translation.bright_green().italic()
-                    );
-                }
-            }
-            Ok(None) => {} // ASCII-only, no translation needed
-            Err(e) => {
-                debug!("STT translation failed: {}", e);
-            }
+/// Displays the context of a reply (the message being replied to).
+///
+/// Prints a dimmed "replying to @User: message" line above the chat message.
+fn display_reply_context(reply: &ReplyInfo) {
+    let max_chars = 50;
+    let truncated_body: String = if reply.parent_msg_body.chars().count() > max_chars {
+        let truncated: String = reply.parent_msg_body.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    } else {
+        reply.parent_msg_body.clone()
+    };
+
+    println!(
+        "  {} {} {}",
+        "┌─ replying to".bright_black(),
+        reply.parent_display_name.bright_blue(),
+        format!("\"{}\"", truncated_body).bright_black().italic()
+    );
+}
+
+/// Translates text using the translator, returning the result without terminal spinner.
+///
+/// Used by spawned background tasks for parallel translation processing.
+/// Logs errors but does not print to terminal on failure (the spawned task
+/// handles its own terminal output).
+async fn translate_for_display(
+    translator: &Translator,
+    content: &str,
+    source_lang: &str,
+) -> Option<TranslationResult> {
+    match translator.translate(content, source_lang).await {
+        Ok(Some(tr)) => Some(tr),
+        Ok(None) => None,
+        Err(e) => {
+            debug!("Translation failed: {}", e);
+            None
         }
     }
 }
@@ -925,65 +1015,6 @@ fn get_romanization(text: &str, google_romanization: Option<&str>) -> Option<Str
     }
 
     None
-}
-
-/// Spinner frames for the loading animation.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Starts a spinner animation in a separate task.
-/// Returns an Arc<AtomicBool> that can be set to true to stop the spinner.
-fn start_spinner(lang_indicator: &str) -> Arc<AtomicBool> {
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_clone = stop_flag.clone();
-    let lang = lang_indicator.to_string();
-
-    // Print first frame synchronously with newline
-    println!(
-        "  {} {} {}",
-        "↳".bright_cyan(),
-        lang_indicator.bright_magenta().bold(),
-        format!("{} Translating...", SPINNER_FRAMES[0]).bright_yellow()
-    );
-
-    tokio::spawn(async move {
-        let mut frame_idx = 1;
-        while !stop_flag_clone.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            if stop_flag_clone.load(Ordering::SeqCst) {
-                break;
-            }
-            let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
-            // Move up to spinner line, clear, print next frame
-            let _ = execute!(
-                stdout(),
-                cursor::MoveUp(1),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::CurrentLine)
-            );
-            println!(
-                "  {} {} {}",
-                "↳".bright_cyan(),
-                lang.bright_magenta().bold(),
-                format!("{} Translating...", frame).bright_yellow()
-            );
-            frame_idx += 1;
-        }
-    });
-
-    stop_flag
-}
-
-/// Clears the spinner line and the empty line below, leaving cursor ready for next output.
-fn clear_current_line() {
-    // Cursor is on line below spinner. Clear current line first, then move up and clear spinner.
-    let _ = execute!(
-        stdout(),
-        cursor::MoveToColumn(0),
-        terminal::Clear(terminal::ClearType::CurrentLine),
-        cursor::MoveUp(1),
-        cursor::MoveToColumn(0),
-        terminal::Clear(terminal::ClearType::CurrentLine)
-    );
 }
 
 #[cfg(test)]

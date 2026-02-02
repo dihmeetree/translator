@@ -5,13 +5,16 @@
 
 mod cache;
 mod config;
+mod events;
 mod transcription;
 mod translator;
 mod twitch;
+mod web;
 
 use anyhow::Result;
 use colored::Colorize;
 use config::Config;
+use events::WebEvent;
 use terminal_size::{terminal_size, Width};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -96,7 +99,7 @@ async fn main() -> Result<()> {
     // Show STT status
     if config.deepgram_api_key.is_some() {
         println!(
-            "{} {} (model: {}, language: {})\n",
+            "{} {} (model: {}, language: {})",
             "STT:".bright_yellow(),
             "Enabled - real-time audio transcription".bright_green(),
             config.deepgram_model.bright_cyan(),
@@ -104,11 +107,34 @@ async fn main() -> Result<()> {
         );
     } else {
         println!(
-            "{} {}\n",
+            "{} {}",
             "STT:".bright_yellow(),
             "Disabled (set DEEPGRAM_API_KEY to enable)".bright_black()
         );
     }
+
+    // Show web UI status
+    println!(
+        "{} {}\n",
+        "Web UI:".bright_yellow(),
+        format!("http://localhost:{}", config.web_port)
+            .bright_green()
+            .bold()
+    );
+
+    // Create broadcast channel for WebSocket event distribution
+    let (event_tx, _) = tokio::sync::broadcast::channel::<WebEvent>(256);
+
+    // Create control channel for web UI → TwitchClient commands (e.g., channel switching)
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel::<web::ControlCommand>(8);
+
+    // Start the web UI server (runs in background)
+    web::start_web_server(
+        config.web_port,
+        event_tx.clone(),
+        config.channel.clone(),
+        control_tx,
+    );
 
     // Create translator and Twitch client
     let translator = Translator::new(
@@ -116,10 +142,19 @@ async fn main() -> Result<()> {
         config.translation_backend.clone(),
         config.cache_size_mb,
     )?;
-    let mut client = TwitchClient::new(config, translator).await?;
+    let mut client = TwitchClient::new(config, translator, event_tx, control_rx).await?;
 
-    // Start processing chat messages
-    client.run().await?;
+    // Run the client with graceful shutdown on SIGINT/SIGTERM.
+    // This ensures child processes (streamlink, ffmpeg) and the transcription
+    // pipeline are cleaned up properly when the container or user stops the app.
+    tokio::select! {
+        result = client.run() => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal, exiting...");
+        }
+    }
 
     Ok(())
 }

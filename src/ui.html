@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Twitch Translator</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0e0e10;
+    --surface:#18181b;
+    --panel:#1f1f23;
+    --border:#2f2f35;
+    --text:#efeff1;
+    --text-dim:#adadb8;
+    --text-muted:#848494;
+    --accent:#9147ff;
+    --accent-hover:#772ce8;
+    --green:#00e676;
+    --red:#f44336;
+    --yellow:#ffd600;
+    --cyan:#00bcd4;
+    --magenta:#e040fb;
+    --radius:6px;
+  }
+  html,body{
+    height:100%;
+    background:var(--bg);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:20px;
+    line-height:1.6;
+    overflow:hidden;
+  }
+  /* ── Layout ─────────────────────────────── */
+  .app{
+    display:flex;
+    flex-direction:column;
+    height:100dvh;
+  }
+  .header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:8px 16px;
+    background:var(--surface);
+    border-bottom:1px solid var(--border);
+    flex-shrink:0;
+    min-height:42px;
+  }
+  .header-left{display:flex;align-items:center;gap:10px}
+  .logo{font-size:20px;font-weight:700;color:var(--accent)}
+  .channel-name{font-size:16px;color:var(--text-dim)}
+  .status{display:flex;align-items:center;gap:6px;font-size:16px;color:var(--text-muted)}
+  .status-dot{
+    width:8px;height:8px;border-radius:50%;
+  }
+  .status-dot.connected{background:var(--green)}
+  .status-dot.disconnected{background:var(--red)}
+  .status-dot.connecting{background:var(--yellow)}
+
+  .channel-bar{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    padding:8px 16px;
+    background:var(--bg);
+    border-bottom:1px solid var(--border);
+    flex-shrink:0;
+  }
+  .channel-bar label{
+    font-size:14px;
+    color:var(--text-muted);
+    white-space:nowrap;
+  }
+  .channel-bar input{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:4px;
+    color:var(--text);
+    font-size:18px;
+    padding:8px 12px;
+    flex:1;
+    min-width:0;
+    outline:none;
+  }
+  .channel-bar input::placeholder{text-transform:capitalize}
+  .channel-bar input:focus{border-color:var(--accent)}
+  .channel-bar button{
+    background:var(--accent);
+    color:#fff;
+    border:none;
+    border-radius:4px;
+    padding:8px 16px;
+    font-size:18px;
+    font-weight:600;
+    cursor:pointer;
+  }
+  .channel-bar button:hover{background:var(--accent-hover)}
+  .channel-bar button:disabled{opacity:.5;cursor:not-allowed}
+
+  .main{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    flex:1;
+    overflow:hidden;
+    min-height:0;
+  }
+
+  /* ── Panel (shared) ─────────────────────── */
+  .panel{
+    display:flex;
+    flex-direction:column;
+    background:var(--panel);
+    overflow:hidden;
+    position:relative;
+  }
+  .panel + .panel{
+    border-left:1px solid var(--border);
+  }
+  .panel-body{
+    flex:1;
+    overflow-y:auto;
+    display:flex;
+    flex-direction:column-reverse;
+    padding:8px;
+    min-height:0;
+    position:relative;
+  }
+  .panel-body::-webkit-scrollbar{width:6px}
+  .panel-body::-webkit-scrollbar-track{background:transparent}
+  .panel-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .panel-body::-webkit-scrollbar-thumb:hover{background:var(--text-muted)}
+
+
+  /* ── Chat Message ───────────────────────── */
+  .msg{
+    padding:16px;
+    margin:8px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:8px;
+    line-height:1.3;
+  }
+  .msg:hover{background:#1e1e24;border-color:#3a3a44}
+
+  .msg-reply{
+    font-size:16px;
+    color:var(--text-muted);
+    margin-bottom:6px;
+    padding:4px 8px;
+    background:rgba(255,255,255,.03);
+    border-radius:4px;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .msg-reply .reply-name{color:var(--cyan)}
+
+  .msg-line{word-wrap:break-word}
+  .badge{
+    display:inline-block;
+    font-size:13px;
+    font-weight:700;
+    padding:2px 5px;
+    border-radius:3px;
+    margin-right:4px;
+    vertical-align:middle;
+    line-height:1.4;
+    color:#fff;
+  }
+  .badge-broadcaster{background:#f44336}
+  .badge-mod{background:#00ad03}
+  .badge-vip{background:#e005b9}
+  .username{font-weight:700;cursor:default}
+
+  .msg-translation{
+    margin-top:6px;
+    padding:8px 12px;
+    font-size:18px;
+    background:rgba(145,71,255,.08);
+    border-left:3px solid var(--accent);
+    border-radius:0 6px 6px 0;
+  }
+  .romanization{color:var(--text-dim)}
+  .translation{color:var(--green)}
+  .lang-tag{
+    display:inline-block;
+    font-size:16px;
+    font-weight:700;
+    color:var(--magenta);
+    margin-right:4px;
+  }
+
+  /* ── Transcription Entry ────────────────── */
+  .stt{
+    padding:16px;
+    margin:8px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:8px;
+    line-height:1.3;
+  }
+  .stt:hover{background:#1e1e24;border-color:#3a3a44}
+  .stt-header{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  .stt-time{font-size:16px;color:var(--text-muted)}
+  .stt-text{color:var(--text);word-wrap:break-word}
+  .stt-translation{
+    margin-top:6px;
+    padding:8px 12px;
+    font-size:18px;
+    background:rgba(145,71,255,.08);
+    border-left:3px solid var(--accent);
+    border-radius:0 6px 6px 0;
+  }
+
+  /* ── Empty state ────────────────────────── */
+  .empty-state{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    position:absolute;
+    inset:0;
+    color:var(--text-muted);
+    text-align:center;
+    padding:20px;
+    gap:8px;
+  }
+  .empty-state .spinner{
+    width:24px;height:24px;
+    border:2px solid var(--border);
+    border-top-color:var(--accent);
+    border-radius:50%;
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ── Mobile Tabs ────────────────────────── */
+  .tab-bar{
+    display:none;
+    border-bottom:1px solid var(--border);
+    background:var(--surface);
+    flex-shrink:0;
+  }
+  .tab-bar button{
+    flex:1;
+    padding:10px;
+    font-size:16px;
+    font-weight:600;
+    background:none;
+    border:none;
+    color:var(--text-muted);
+    cursor:pointer;
+    border-bottom:2px solid transparent;
+  }
+  .tab-bar button.active{
+    color:var(--text);
+    border-bottom-color:var(--text);
+  }
+
+  /* ── Responsive ─────────────────────────── */
+  @media(max-width:768px){
+    .main{
+      grid-template-columns:1fr;
+      grid-template-rows:1fr;
+    }
+    .panel.chat-panel{grid-row:1;grid-column:1}
+    .panel.stt-panel{grid-row:1;grid-column:1}
+    .panel + .panel{border-left:none}
+    .tab-bar{display:flex}
+    .panel.hidden-mobile{display:none}
+  }
+  @media(max-width:480px){
+    .header{padding:6px 10px}
+    .channel-bar{padding:6px 10px}
+    .logo{font-size:14px}
+    .channel-bar label{display:none}
+    .msg{padding:10px}
+    .stt{padding:10px}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <span class="logo">Twitch Translator</span>
+      <span class="channel-name" id="channelName"></span>
+    </div>
+    <div class="status">
+      <div class="status-dot connecting" id="statusDot"></div>
+    </div>
+  </div>
+
+  <!-- Channel switch bar -->
+  <form class="channel-bar" id="channelForm" autocomplete="off" action="javascript:void(0)">
+    <label>Switch channel:</label>
+    <input type="text" id="channelInput" placeholder="e.g. xqc"
+           maxlength="25" spellcheck="false" autocomplete="off" autocorrect="off"
+           autocapitalize="off" enterkeyhint="go">
+    <button type="submit" id="channelBtn">Go</button>
+  </form>
+
+  <!-- Mobile tab bar -->
+  <div class="tab-bar" id="tabBar">
+    <button class="active" data-tab="chat">Chat</button>
+    <button data-tab="stt">Audio</button>
+  </div>
+
+  <!-- Main content -->
+  <div class="main">
+    <!-- Chat Panel -->
+    <div class="panel chat-panel" id="chatPanel">
+      <div class="panel-body" id="chatBody">
+        <div class="empty-state" id="chatEmpty">
+          <div class="spinner"></div>
+          <span>Waiting for messages...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Transcription Panel -->
+    <div class="panel stt-panel hidden-mobile" id="sttPanel">
+      <div class="panel-body" id="sttBody">
+        <div class="empty-state" id="sttEmpty">
+          <div class="spinner"></div>
+          <span>Waiting for audio...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // ── Config ───────────────────────────────
+  const MAX_MESSAGES = 100;
+  const RECONNECT_MIN = 1000;
+  const RECONNECT_MAX = 30000;
+
+  // ── State ────────────────────────────────
+  let ws = null;
+  let reconnectDelay = RECONNECT_MIN;
+  let reconnectTimer = null;
+
+  // ── DOM refs ─────────────────────────────
+  const statusDot = document.getElementById('statusDot');
+  const channelNameEl = document.getElementById('channelName');
+  const chatBody = document.getElementById('chatBody');
+  const sttBody = document.getElementById('sttBody');
+  const tabBar = document.getElementById('tabBar');
+  const chatPanel = document.getElementById('chatPanel');
+  const sttPanel = document.getElementById('sttPanel');
+  const channelInput = document.getElementById('channelInput');
+  const channelBtn = document.getElementById('channelBtn');
+
+  // ── Fetch config and init ────────────────
+  fetch('/api/config')
+    .then(r => r.json())
+    .then(cfg => {
+      if(cfg.channel){
+        channelNameEl.textContent = '#' + cfg.channel;
+      }
+    })
+    .catch(() => {});
+
+  // ── Mobile tabs ──────────────────────────
+  tabBar.addEventListener('click', function(e){
+    const btn = e.target.closest('button[data-tab]');
+    if(!btn) return;
+    const tab = btn.dataset.tab;
+    tabBar.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    if(tab === 'chat'){
+      chatPanel.classList.remove('hidden-mobile');
+      sttPanel.classList.add('hidden-mobile');
+    } else {
+      sttPanel.classList.remove('hidden-mobile');
+      chatPanel.classList.add('hidden-mobile');
+    }
+  });
+
+  // ── Channel switching ──────────────────
+  function switchChannel(){
+    var ch = channelInput.value.trim().toLowerCase();
+    if(!ch || !/^[a-z0-9_]{1,25}$/.test(ch)) return;
+    channelBtn.disabled = true;
+    fetch('/api/channel', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({channel:ch})
+    })
+    .then(function(r){
+      if(!r.ok) throw new Error('Failed');
+      return r.json();
+    })
+    .then(function(){
+      channelInput.value = '';
+    })
+    .catch(function(){})
+    .finally(function(){
+      channelBtn.disabled = false;
+    });
+  }
+
+  document.getElementById('channelForm').addEventListener('submit', function(e){
+    e.preventDefault();
+    switchChannel();
+  });
+
+  function clearPanels(){
+    // Clear chat panel
+    while(chatBody.firstChild) chatBody.removeChild(chatBody.firstChild);
+    var ce = document.createElement('div');
+    ce.className = 'empty-state';
+    ce.id = 'chatEmpty';
+    ce.innerHTML = '<div class="spinner"></div><span>Waiting for messages...</span>';
+    chatBody.appendChild(ce);
+
+    // Clear STT panel
+    while(sttBody.firstChild) sttBody.removeChild(sttBody.firstChild);
+    var se = document.createElement('div');
+    se.className = 'empty-state';
+    se.id = 'sttEmpty';
+    se.innerHTML = '<div class="spinner"></div><span>Waiting for audio...</span>';
+    sttBody.appendChild(se);
+
+    chatBuffer.length = 0;
+    sttBuffer.length = 0;
+  }
+
+  // ── Buffered insert: hold messages while scrolled up, flush on return ──
+  var chatBuffer = [];
+  var sttBuffer = [];
+
+  function isAtBottom(el){
+    return Math.abs(el.scrollTop) < 5;
+  }
+
+  function flushBuffer(container, buffer){
+    while(buffer.length){
+      container.prepend(buffer.shift());
+    }
+    capChildren(container);
+  }
+
+  chatBody.addEventListener('scroll', function(){
+    if(isAtBottom(chatBody) && chatBuffer.length) flushBuffer(chatBody, chatBuffer);
+  });
+  sttBody.addEventListener('scroll', function(){
+    if(isAtBottom(sttBody) && sttBuffer.length) flushBuffer(sttBody, sttBuffer);
+  });
+
+  // ── Cap oldest messages (lastChild = visually top in column-reverse) ──
+  function capChildren(parent){
+    while(parent.children.length > MAX_MESSAGES){
+      parent.removeChild(parent.lastChild);
+    }
+  }
+
+  // ── Escape HTML ──────────────────────────
+  function esc(s){
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // ── Render chat message ──────────────────
+  function renderChat(msg){
+    var ce = document.getElementById('chatEmpty');
+    if(ce) ce.remove();
+
+    const div = document.createElement('div');
+    div.className = 'msg';
+
+    let html = '';
+
+    // Reply context
+    if(msg.reply_to){
+      html += '<div class="msg-reply">replying to <span class="reply-name">@'
+        + esc(msg.reply_to.parent_username) + '</span>: '
+        + esc(truncate(msg.reply_to.parent_message, 60)) + '</div>';
+    }
+
+    // Main line: badges + username + message
+    html += '<div class="msg-line">';
+
+    if(msg.is_broadcaster) html += '<span class="badge badge-broadcaster">B</span>';
+    else if(msg.is_mod) html += '<span class="badge badge-mod">M</span>';
+    else if(msg.is_vip) html += '<span class="badge badge-vip">V</span>';
+
+    const color = msg.color || generateColor(msg.username);
+    html += '<span class="username" style="color:' + esc(color) + '">'
+      + esc(msg.username) + '</span>: '
+      + esc(msg.content);
+    html += '</div>';
+
+    // Translation block
+    if(msg.translation){
+      html += '<div class="msg-translation">';
+      if(msg.romanization){
+        html += '<div class="romanization">\u266A ' + esc(msg.romanization) + '</div>';
+      }
+      html += '<div class="translation">';
+      if(msg.language_name){
+        html += '\u21B3 <span class="lang-tag">[' + esc(msg.language_name) + ']</span>';
+      }
+      html += esc(msg.translation) + '</div>';
+      html += '</div>';
+    }
+
+    div.innerHTML = html;
+    if(isAtBottom(chatBody)){
+      chatBody.prepend(div);
+      capChildren(chatBody);
+    } else {
+      chatBuffer.push(div);
+    }
+  }
+
+  // ── Render transcription ─────────────────
+  function renderStt(msg){
+    if(!msg.translation) return;
+    var se = document.getElementById('sttEmpty');
+    if(se) se.remove();
+
+    const div = document.createElement('div');
+    div.className = 'stt';
+
+    const time = new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+    let html = '<div class="stt-header">'
+      + '<span class="stt-time">' + esc(time) + '</span>'
+      + '</div>';
+    html += '<div class="stt-text">' + esc(msg.transcript) + '</div>';
+
+    if(msg.translation){
+      html += '<div class="stt-translation">';
+      if(msg.romanization){
+        html += '<div class="romanization">\u266A ' + esc(msg.romanization) + '</div>';
+      }
+      html += '<div class="translation">';
+      if(msg.language_name){
+        html += '\u21B3 <span class="lang-tag">[' + esc(msg.language_name) + ']</span>';
+      }
+      html += esc(msg.translation) + '</div>';
+      html += '</div>';
+    }
+
+    div.innerHTML = html;
+    if(isAtBottom(sttBody)){
+      sttBody.prepend(div);
+      capChildren(sttBody);
+    } else {
+      sttBuffer.push(div);
+    }
+  }
+
+  // ── Helpers ──────────────────────────────
+  function truncate(s, max){
+    return s.length > max ? s.slice(0, max) + '...' : s;
+  }
+
+  function generateColor(name){
+    let h = 0;
+    for(let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
+    const colors = [
+      '#ff0000','#00ff00','#0000ff','#ffff00','#ff00ff','#00ffff',
+      '#ff7f00','#7fff00','#ff007f','#007fff','#7f00ff','#ff7f7f'
+    ];
+    return colors[Math.abs(h) % colors.length];
+  }
+
+  // ── WebSocket connection ─────────────────
+  function setStatus(state){
+    statusDot.className = 'status-dot ' + state;
+  }
+
+  function connect(){
+    if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    setStatus('connecting');
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+    ws.onopen = function(){
+      setStatus('connected');
+      reconnectDelay = RECONNECT_MIN;
+    };
+
+    ws.onclose = function(){
+      setStatus('disconnected');
+      scheduleReconnect();
+    };
+
+    ws.onerror = function(){
+      // onclose will fire after this
+    };
+
+    ws.onmessage = function(e){
+      try {
+        const event = JSON.parse(e.data);
+        switch(event.type){
+          case 'ChatMessage': renderChat(event); break;
+          case 'Transcription': renderStt(event); break;
+          case 'ChannelChanged':
+            channelNameEl.textContent = '#' + event.channel;
+            clearPanels();
+            break;
+        }
+      } catch(err){
+        // Ignore malformed messages
+      }
+    };
+  }
+
+  function scheduleReconnect(){
+    if(reconnectTimer) return;
+    setStatus('connecting');
+    reconnectTimer = setTimeout(function(){
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+  }
+
+  // ── Start ────────────────────────────────
+  connect();
+})();
+</script>
+</body>
+</html>

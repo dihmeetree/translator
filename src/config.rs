@@ -51,6 +51,17 @@ pub struct Config {
     /// Defaults to `DEFAULT_LANGUAGE` if set, otherwise "multi" for auto-detection.
     /// Can be overridden explicitly with `STT_LANGUAGE`.
     pub stt_language: String,
+
+    /// Port for the web UI HTTP/WebSocket server.
+    /// Defaults to 3000. The web UI is always started and serves the
+    /// live translation dashboard at `http://localhost:{web_port}`.
+    pub web_port: u16,
+
+    /// Timeout in seconds for the IRC WebSocket read loop.
+    /// If no message is received within this duration, a keepalive PING is sent.
+    /// Lower values detect dead connections faster but generate more keepalive traffic.
+    /// Defaults to 300 seconds (5 minutes).
+    pub irc_timeout_secs: u64,
 }
 
 impl Config {
@@ -120,6 +131,16 @@ impl Config {
                 .unwrap_or_else(|| "multi".to_string())
         });
 
+        let web_port: u16 = std::env::var("WEB_PORT")
+            .unwrap_or_else(|_| "3000".to_string())
+            .parse()
+            .context("WEB_PORT must be a valid port number")?;
+
+        let irc_timeout_secs: u64 = std::env::var("IRC_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()
+            .context("IRC_TIMEOUT_SECS must be a valid positive number")?;
+
         Ok(Config {
             channel,
             oauth_token,
@@ -132,6 +153,8 @@ impl Config {
             deepgram_api_key,
             deepgram_model,
             stt_language,
+            web_port,
+            irc_timeout_secs,
         })
     }
 }

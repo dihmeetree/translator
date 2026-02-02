@@ -57,7 +57,7 @@ crossterm = "0.28"
 any_ascii = "0.3"
 
 # HTTP server for translation API
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
 # SQLite for persistent translation cache

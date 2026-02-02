@@ -1,0 +1,35 @@
+# fly.toml app configuration file generated for twitch-translator on 2026-02-02T17:16:09Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'twitch-translator'
+primary_region = 'ord'
+
+[build]
+
+[env]
+  DEFAULT_LANGUAGE = 'ru'
+  RUST_LOG = 'twitch_translator=debug'
+  TRANSLATION_API_URL = 'https://translator.fly.dev'
+  TRANSLATION_BACKEND = 'google'
+  TWITCH_CHANNEL = 'dmitry_bale'
+  WEB_PORT = '3000'
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  max_machines_running = 1
+
+[mounts]
+  source = 'translator_data'
+  destination = '/app/data'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
