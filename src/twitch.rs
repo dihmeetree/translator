@@ -3,6 +3,7 @@
 //! Handles connecting to Twitch chat via IRC over WebSocket and processing messages.
 
 use crate::config::Config;
+use crate::transcription::{TranscriptionConfig, TranscriptionEvent};
 use crate::translator::Translator;
 use any_ascii::any_ascii;
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use terminal_size::{terminal_size, Width};
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -33,6 +35,23 @@ pub struct TwitchClient {
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+
+    /// Receiver for transcription events (None if transcription disabled).
+    stt_rx: Option<mpsc::Receiver<TranscriptionEvent>>,
+
+    /// Shutdown signal sender for the transcription pipeline.
+    stt_shutdown_tx: Option<watch::Sender<bool>>,
+
+    /// Tracks the current interim transcript for overwrite display.
+    current_interim: Option<String>,
+
+    /// Tracks the last finalized transcript to deduplicate consecutive
+    /// identical `is_final` results from Deepgram.
+    last_final_transcript: Option<String>,
+
+    /// When the current interim was last updated.
+    /// Used to auto-commit stale interims that Deepgram never finalized.
+    interim_set_at: Option<tokio::time::Instant>,
 }
 
 /// Parsed chat message from Twitch IRC.
@@ -73,6 +92,31 @@ struct ReplyInfo {
     parent_msg_body: String,
 }
 
+/// Duration to wait after the last interim update before auto-committing it.
+/// Handles cases where Deepgram doesn't send `is_final` for a segment.
+const INTERIM_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Actions produced by the main event loop's `tokio::select!` branches.
+///
+/// This enum decouples the `select!` block (which borrows individual fields)
+/// from the action handling (which needs `&mut self`), avoiding borrow conflicts.
+enum LoopAction {
+    /// An IRC text message was received.
+    IrcMessage(String),
+    /// An IRC WebSocket error occurred.
+    IrcError(String),
+    /// The IRC WebSocket connection was closed.
+    IrcClosed,
+    /// The IRC keepalive timeout expired.
+    IrcTimeout,
+    /// A transcription event was received from the STT pipeline.
+    SttEvent(TranscriptionEvent),
+    /// The transcription channel was closed (pipeline exited).
+    SttClosed,
+    /// An interim transcript has been sitting for too long without being finalized.
+    SttInterimTimeout,
+}
+
 impl TwitchClient {
     /// Creates a new TwitchClient and connects to the IRC server.
     ///
@@ -88,13 +132,45 @@ impl TwitchClient {
             .context("Failed to connect to Twitch IRC WebSocket")?;
 
         let mut client = Self {
-            config,
+            config: config.clone(),
             translator,
             ws_stream,
+            stt_rx: None,
+            stt_shutdown_tx: None,
+            current_interim: None,
+            last_final_transcript: None,
+            interim_set_at: None,
         };
 
         client.authenticate().await?;
         client.join_channel().await?;
+
+        // Start transcription pipeline if Deepgram API key is configured
+        if let Some(ref api_key) = config.deepgram_api_key {
+            let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>(64);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let stt_config = TranscriptionConfig {
+                api_key: api_key.clone(),
+                channel: config.channel.clone(),
+                language: config.stt_language.clone(),
+                model: config.deepgram_model.clone(),
+            };
+
+            tokio::spawn(crate::transcription::run_pipeline(
+                stt_config,
+                event_tx,
+                shutdown_rx,
+            ));
+
+            client.stt_rx = Some(event_rx);
+            client.stt_shutdown_tx = Some(shutdown_tx);
+
+            info!(
+                "Speech-to-text enabled (model: {}, language: {})",
+                config.deepgram_model, config.stt_language
+            );
+        }
 
         Ok(client)
     }
@@ -140,35 +216,100 @@ impl TwitchClient {
         Ok(())
     }
 
-    /// Main loop that processes incoming messages.
+    /// Main loop that processes incoming IRC messages and transcription events.
+    ///
+    /// When transcription is enabled, uses `tokio::select!` to multiplex
+    /// IRC WebSocket messages and transcription events from the STT pipeline.
+    /// When disabled, processes only IRC messages as before.
     pub async fn run(&mut self) -> Result<()> {
         print_thick_divider();
         println!("{}", "Waiting for messages...".bright_black().italic());
 
         loop {
-            let message = match timeout(Duration::from_secs(300), self.ws_stream.next()).await {
-                Ok(Some(Ok(msg))) => msg,
-                Ok(Some(Err(e))) => {
-                    error!("WebSocket error: {}", e);
-                    break;
+            // Produce a LoopAction from select! without holding &mut self borrows,
+            // then handle it separately to allow full &mut self access.
+            // Compute the interim commit deadline before entering select!
+            // so we don't borrow self inside the macro.
+            let interim_deadline = self.interim_set_at.map(|t| t + INTERIM_COMMIT_TIMEOUT);
+
+            let action = if let Some(ref mut stt_rx) = self.stt_rx {
+                tokio::select! {
+                    ws_result = timeout(Duration::from_secs(300), self.ws_stream.next()) => {
+                        match ws_result {
+                            Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
+                            Ok(Some(Ok(_))) => continue,
+                            Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
+                            Ok(None) => LoopAction::IrcClosed,
+                            Err(_) => LoopAction::IrcTimeout,
+                        }
+                    }
+                    stt_event = stt_rx.recv() => {
+                        match stt_event {
+                            Some(event) => LoopAction::SttEvent(event),
+                            None => LoopAction::SttClosed,
+                        }
+                    }
+                    // Auto-commit stale interims that Deepgram never finalized
+                    _ = async {
+                        match interim_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        LoopAction::SttInterimTimeout
+                    }
                 }
-                Ok(None) => {
-                    warn!("WebSocket connection closed");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - send PING to keep connection alive
-                    debug!("Sending keepalive PING");
-                    self.send_raw("PING :tmi.twitch.tv").await?;
-                    continue;
+            } else {
+                match timeout(Duration::from_secs(300), self.ws_stream.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => LoopAction::IrcMessage(text),
+                    Ok(Some(Ok(_))) => continue,
+                    Ok(Some(Err(e))) => LoopAction::IrcError(e.to_string()),
+                    Ok(None) => LoopAction::IrcClosed,
+                    Err(_) => LoopAction::IrcTimeout,
                 }
             };
 
-            if let Message::Text(text) = message {
-                for line in text.lines() {
-                    self.handle_irc_message(line).await?;
+            match action {
+                LoopAction::IrcMessage(text) => {
+                    for line in text.lines() {
+                        self.handle_irc_message(line).await?;
+                    }
+                }
+                LoopAction::IrcError(e) => {
+                    error!("WebSocket error: {}", e);
+                    break;
+                }
+                LoopAction::IrcClosed => {
+                    warn!("WebSocket connection closed");
+                    break;
+                }
+                LoopAction::IrcTimeout => {
+                    debug!("Sending keepalive PING");
+                    self.send_raw("PING :tmi.twitch.tv").await?;
+                }
+                LoopAction::SttEvent(event) => {
+                    self.handle_transcription_event(event).await;
+                }
+                LoopAction::SttClosed => {
+                    warn!("Transcription channel closed");
+                    self.stt_rx = None;
+                }
+                LoopAction::SttInterimTimeout => {
+                    // Deepgram didn't finalize this segment - commit the interim
+                    // as permanent so it doesn't get lost when new speech arrives.
+                    if let Some(transcript) = self.current_interim.clone() {
+                        debug!("Auto-committing stale interim: {}", transcript);
+                        self.clear_interim_transcript();
+                        self.last_final_transcript = Some(transcript.clone());
+                        self.display_final_transcript(&transcript, 0.0).await;
+                    }
                 }
             }
+        }
+
+        // Signal transcription pipeline to shut down
+        if let Some(ref shutdown_tx) = self.stt_shutdown_tx {
+            let _ = shutdown_tx.send(true);
         }
 
         Ok(())
@@ -295,7 +436,7 @@ impl TwitchClient {
     }
 
     /// Processes a chat message, detecting language and translating if needed.
-    async fn process_chat_message(&self, msg: ChatMessage) {
+    async fn process_chat_message(&mut self, msg: ChatMessage) {
         let display = msg
             .display_name
             .as_ref()
@@ -304,6 +445,9 @@ impl TwitchClient {
 
         // Build badge prefix
         let badge_prefix = build_badge_prefix(msg.is_broadcaster, msg.is_mod, msg.is_vip);
+
+        // Reset interim state so a stale timeout doesn't fire during chat output
+        self.clear_interim_transcript();
 
         // Print divider before each message
         print_divider();
@@ -508,6 +652,139 @@ impl TwitchClient {
                     "Error:".bright_red().bold(),
                     "Message could not be translated.".bright_red()
                 );
+            }
+        }
+    }
+
+    /// Handles a transcription event from the STT pipeline.
+    ///
+    /// Interim results are tracked silently (no terminal output) so we know
+    /// speech is active. Final results are displayed with the `[Audio]` prefix
+    /// and passed through the translation pipeline.
+    async fn handle_transcription_event(&mut self, event: TranscriptionEvent) {
+        match event {
+            TranscriptionEvent::Interim { transcript } => {
+                // Track the interim silently — no terminal output.
+                // This keeps `current_interim` populated so the timeout
+                // auto-commit can rescue segments Deepgram never finalizes.
+                self.current_interim = Some(transcript);
+                self.interim_set_at = Some(tokio::time::Instant::now());
+            }
+            TranscriptionEvent::Final {
+                transcript,
+                confidence,
+            } => {
+                // Deduplicate: skip if this final is identical to the last one.
+                // Deepgram can send multiple is_final segments with overlapping text.
+                let is_duplicate = self
+                    .last_final_transcript
+                    .as_ref()
+                    .is_some_and(|last| last == &transcript);
+
+                if is_duplicate {
+                    self.clear_interim_transcript();
+                } else {
+                    self.clear_interim_transcript();
+                    self.last_final_transcript = Some(transcript.clone());
+                    self.display_final_transcript(&transcript, confidence).await;
+                }
+            }
+            TranscriptionEvent::Error(msg) => {
+                self.clear_interim_transcript();
+                println!("{} {}", "[Audio]".bright_red().bold(), msg.bright_red());
+            }
+            TranscriptionEvent::Shutdown => {
+                self.clear_interim_transcript();
+                info!("Transcription pipeline shut down");
+            }
+        }
+    }
+
+    /// Resets interim tracking state without any terminal output.
+    ///
+    /// Called before printing final results or chat messages so stale
+    /// interim data doesn't interfere with timeout auto-commit logic.
+    fn clear_interim_transcript(&mut self) {
+        self.current_interim = None;
+        self.interim_set_at = None;
+    }
+
+    /// Displays a finalized transcript and optionally translates it.
+    ///
+    /// Shows the transcript with `[Audio]` prefix and a visual divider,
+    /// then runs it through the translation pipeline if non-English.
+    async fn display_final_transcript(&self, transcript: &str, _confidence: f64) {
+        print_divider();
+
+        println!(
+            "{} {}",
+            "[Audio]".bright_cyan().bold(),
+            transcript.bright_white()
+        );
+
+        // Run through translation pipeline (same logic as chat messages)
+        if let Some(ref default_lang) = self.config.default_language {
+            self.display_stt_translation(transcript, default_lang).await;
+        } else {
+            let detection = self.translator.detect_language(transcript);
+            if let Some(ref det) = detection {
+                if !det.is_english && det.confidence >= self.config.detection_confidence_threshold {
+                    self.display_stt_translation(transcript, &det.language)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Translates an STT transcript and displays the romanization and translation.
+    ///
+    /// Shows a spinner while waiting for the translation API, matching the
+    /// visual behavior of chat message translations.
+    async fn display_stt_translation(&self, text: &str, source_lang: &str) {
+        let lang_indicator = format!("[{}]", source_lang.to_uppercase());
+
+        // Show spinner only when an API call is needed (not cached)
+        let needs_api = self.translator.needs_api_call(text, source_lang);
+        let stop_spinner = if needs_api {
+            Some(start_spinner(&lang_indicator))
+        } else {
+            None
+        };
+
+        let result = self.translator.translate(text, source_lang).await;
+
+        // Stop spinner and clear its line if we started one
+        if let Some(stop_flag) = stop_spinner {
+            stop_flag.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            clear_current_line();
+        }
+
+        match result {
+            Ok(Some(result)) => {
+                let has_translation = !result.translation.trim().eq_ignore_ascii_case(text.trim());
+
+                if has_translation {
+                    if let Some(romanization) =
+                        get_romanization(text, result.romanization.as_deref())
+                    {
+                        println!(
+                            "  {} {}",
+                            "♪".bright_yellow(),
+                            romanization.bright_white().dimmed()
+                        );
+                    }
+                    println!(
+                        "  {} {} {}",
+                        "↳".bright_cyan(),
+                        lang_indicator.bright_magenta().bold(),
+                        result.translation.bright_green().italic()
+                    );
+                }
+            }
+            Ok(None) => {} // ASCII-only, no translation needed
+            Err(e) => {
+                debug!("STT translation failed: {}", e);
             }
         }
     }

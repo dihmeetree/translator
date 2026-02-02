@@ -5,6 +5,7 @@
 
 mod cache;
 mod config;
+mod transcription;
 mod translator;
 mod twitch;
 
@@ -52,7 +53,7 @@ async fn main() -> Result<()> {
         " ".repeat(title_padding),
         title,
         "",
-        width = inner_width - title_padding - title.len()
+        width = inner_width.saturating_sub(title_padding + title.len())
     );
 
     let subtitle_padding = inner_width.saturating_sub(subtitle.len()) / 2;
@@ -61,7 +62,7 @@ async fn main() -> Result<()> {
         " ".repeat(subtitle_padding),
         subtitle,
         "",
-        width = inner_width - subtitle_padding - subtitle.len()
+        width = inner_width.saturating_sub(subtitle_padding + subtitle.len())
     );
 
     println!("\n{}", top_border.bright_cyan().bold());
@@ -79,16 +80,33 @@ async fn main() -> Result<()> {
     // Show translation mode
     if let Some(ref lang) = config.default_language {
         println!(
-            "{} {} {}\n",
+            "{} {} {}",
             "Mode:".bright_yellow(),
             "Translating ALL messages from".white(),
             lang.to_uppercase().bright_magenta().bold()
         );
     } else {
         println!(
-            "{} {}\n",
+            "{} {}",
             "Mode:".bright_yellow(),
             "Auto-detecting non-English messages".white()
+        );
+    }
+
+    // Show STT status
+    if config.deepgram_api_key.is_some() {
+        println!(
+            "{} {} (model: {}, language: {})\n",
+            "STT:".bright_yellow(),
+            "Enabled - real-time audio transcription".bright_green(),
+            config.deepgram_model.bright_cyan(),
+            config.stt_language.bright_cyan()
+        );
+    } else {
+        println!(
+            "{} {}\n",
+            "STT:".bright_yellow(),
+            "Disabled (set DEEPGRAM_API_KEY to enable)".bright_black()
         );
     }
 

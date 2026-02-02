@@ -38,6 +38,19 @@ pub struct Config {
     /// Maximum size of the translation cache in megabytes.
     /// When exceeded, oldest entries are purged automatically.
     pub cache_size_mb: u64,
+
+    /// Deepgram API key for speech-to-text transcription.
+    /// When set, enables real-time audio transcription of the stream.
+    /// If not set, transcription is disabled and the app behaves as before.
+    pub deepgram_api_key: Option<String>,
+
+    /// Deepgram model to use for transcription (e.g., "nova-2", "nova-2-general").
+    pub deepgram_model: String,
+
+    /// Language hint for Deepgram speech-to-text.
+    /// Defaults to `DEFAULT_LANGUAGE` if set, otherwise "multi" for auto-detection.
+    /// Can be overridden explicitly with `STT_LANGUAGE`.
+    pub stt_language: String,
 }
 
 impl Config {
@@ -54,6 +67,9 @@ impl Config {
     /// - `DETECTION_CONFIDENCE`: Minimum confidence for language detection (default: 0.5)
     /// - `DEFAULT_LANGUAGE`: Source language code to translate all messages from (e.g., "ru")
     /// - `CACHE_SIZE_MB`: Maximum cache size in megabytes (default: 50)
+    /// - `DEEPGRAM_API_KEY`: Deepgram API key to enable stream audio transcription
+    /// - `DEEPGRAM_MODEL`: Deepgram model for transcription (default: "nova-2")
+    /// - `STT_LANGUAGE`: Language hint for speech-to-text (default: DEFAULT_LANGUAGE or "multi")
     pub fn load() -> Result<Self> {
         // Load .env file if present (ignore errors if not found)
         let _ = dotenvy::dotenv();
@@ -93,6 +109,17 @@ impl Config {
             .parse()
             .context("CACHE_SIZE_MB must be a valid positive number")?;
 
+        let deepgram_api_key = std::env::var("DEEPGRAM_API_KEY").ok();
+
+        let deepgram_model =
+            std::env::var("DEEPGRAM_MODEL").unwrap_or_else(|_| "nova-2".to_string());
+
+        let stt_language = std::env::var("STT_LANGUAGE").unwrap_or_else(|_| {
+            default_language
+                .clone()
+                .unwrap_or_else(|| "multi".to_string())
+        });
+
         Ok(Config {
             channel,
             oauth_token,
@@ -102,6 +129,9 @@ impl Config {
             detection_confidence_threshold,
             default_language,
             cache_size_mb,
+            deepgram_api_key,
+            deepgram_model,
+            stt_language,
         })
     }
 }
